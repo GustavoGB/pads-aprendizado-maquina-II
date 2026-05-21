@@ -1,0 +1,1691 @@
+---
+title: "Clima do Brasil — Supervisionado vs Não-Supervisionado"
+subtitle: "PCA · Random Forest · Ensemble · STL · Clustering · Open-Meteo ERA5"
+author: "Aprendizado de Máquina 2 — Insper"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-title: "Sumário"
+    number-sections: true
+    code-fold: true
+    code-summary: "Ver código"
+    fig-width: 10
+    fig-height: 5.5
+    fig-align: center
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r setup}
+#| label: setup
+
+library(tidyverse)
+library(jsonlite)
+library(GGally)
+library(factoextra)
+library(FactoMineR)
+library(cluster)
+library(patchwork)
+library(tsibble)
+library(fable)
+library(feasts)
+library(fabletools)
+library(ranger)
+library(doParallel)
+
+```
+
+---
+
+# Introdução
+
+Este relatório unifica dois modelos para a disciplina Aprendizado de Máquina II aplicados a **dados climáticos reais do Brasil**.
+
+## O Desafio dos Dados Climáticos
+
+Dados climáticos são amplamente utilizados na construção de modelos preditivos e analíticos. Entretanto, existem desafios distintos e extremamente relevantes nesse domínio — em particular, a diferença entre **dados observacionais** (medições de estações meteorológicas, satélites e boias oceânicas) e **dados de previsão** (saídas de modelos numéricos que simulam a atmosfera para o futuro). Além disso, diferentes provedores disponibilizam dados com características, resoluções e coberturas distintas:
+
+| Provedor | Tipo de Dado | Resolução Espacial | Exemplo de Uso |
+|----------|-------------|--------------------|----|
+| **ERA5 (ECMWF)** | Reanálise — combina observações históricas com modelos numéricos para produzir um registro global consistente do clima passado. Cobre de 1940 até ~5 dias atrás. | ~31 km (0.25°) | Reconstrução climática de longo prazo; validação de modelos; estudos de tendência e variabilidade |
+| **ECMWF IFS** | Previsão operacional — modelo numérico de última geração que produz previsões determinísticas e ensemble (51 membros) para até 15 dias, e previsões estendidas sazonais. | ~9 km (HRES) | Previsão meteorológica operacional; planejamento de safras; gestão de risco de energia eólica/solar |
+| **NASA (MERRA-2 / POWER)** | Reanálise e dados de satélite — MERRA-2 é similar ao ERA5 com foco em composição atmosférica (aerossóis, ozônio); o projeto POWER disponibiliza dados solares e meteorológicos para aplicações em energia e agricultura. | ~50 km (0.5°) | Dimensionamento de painéis solares; estimativa de evapotranspiração agrícola; estudos de qualidade do ar |
+| **GFS (NOAA/NCEP)** | Previsão operacional americana — modelo global com rodadas a cada 6h, previsões de até 16 dias. Dados abertos e gratuitos em tempo real. | ~13 km (resolução variável) | Previsão de curto prazo; inicialização de modelos regionais (WRF, Eta); monitoramento de eventos extremos (furacões, frentes frias) |
+
+A distinção entre reanálise e previsão é fundamental: **reanálises** (ERA5, MERRA-2) usam todas as observações disponíveis para reconstruir o estado passado da atmosfera — são os dados mais confiáveis para análise histórica, mas não estão disponíveis em tempo real. **Previsões operacionais** (IFS, GFS) projetam o estado futuro da atmosfera a partir de condições iniciais, com incerteza que cresce a cada hora de horizonte.
+
+## Importância Setorial do Monitoramento Climático
+
+O monitoramento e a modelagem do clima são realizados por diversos institutos governamentais (INMET, INPE/CPTEC no Brasil; NOAA, NASA nos EUA; ECMWF na Europa), empresas privadas e institutos de pesquisa. A relevância desses dados permeia setores estratégicos da economia:
+
+- **Agricultura:** previsões de precipitação e temperatura orientam decisões de plantio, irrigação, aplicação de defensivos e colheita. Safras inteiras dependem de janelas climáticas — uma geada não prevista pode destruir uma safra de café, e a previsão sazonal determina o planejamento da segunda safra de milho. No Brasil, o agronegócio representa cerca de 25% do PIB, tornando a previsão climática um insumo econômico de primeira ordem.
+
+- **Empresas petrolíferas e de energia:** operações offshore (plataformas, FPSOs) dependem de previsões de vento e ondas para planejamento de operações de carga e logística marítima. Parques eólicos e solares precisam de estimativas precisas de recurso energético (radiação, velocidade do vento) para dimensionamento e para comercialização de energia no mercado spot. A reanálise ERA5 é amplamente usada para estimar o potencial eólico/solar em estudos de viabilidade.
+
+- **Mineração:** atividades a céu aberto são diretamente impactadas por chuvas intensas que paralisam operações, comprometem a estabilidade de barragens de rejeitos e inviabilizam transporte em estradas de terra. A previsão de precipitação acumulada é crítica para gestão de risco operacional e ambiental.
+
+- **Portuária e navegação:** a profundidade do calado em portos fluviais (como o de Manaus) depende do regime de chuvas e do nível dos rios — previsões sazonais orientam a logística de grandes cargueiros. Portos marítimos dependem de previsões de maré, vento e ondas para operações de atracação e carga.
+
+## Ensembles em Modelos Climáticos
+
+Uma das técnicas mais poderosas em meteorologia e aprendizado de máquina é o uso de **ensembles** — a combinação de múltiplos modelos ou múltiplas execuções de um mesmo modelo para gerar previsões mais robustas.
+
+Na meteorologia operacional, o conceito de ensemble é empregado de duas formas complementares:
+
+1. **Ensemble de perturbações iniciais (multi-member):** o mesmo modelo numérico (por exemplo, o IFS do ECMWF) é executado múltiplas vezes com pequenas perturbações nas condições iniciais. Como a atmosfera é um sistema caótico, pequenas diferenças nas condições iniciais amplificam-se ao longo do tempo. Os 51 membros do ensemble IFS capturam essa sensibilidade e produzem uma **distribuição de previsões** — o spread entre os membros quantifica a incerteza. Quando os membros convergem, a confiança é alta; quando divergem, o cenário é incerto.
+
+2. **Multi-model ensemble:** previsões de modelos diferentes (GFS, IFS, GEM canadense, ICON alemão) são combinadas — tipicamente por média ponderada, onde os pesos podem ser calibrados historicamente. A literatura mostra consistentemente que a média de múltiplos modelos supera qualquer modelo individual, porque cada um tem vieses sistemáticos diferentes que tendem a se cancelar na combinação.
+
+Neste projeto, aplicamos o princípio de ensemble no contexto de aprendizado de máquina supervisionado: combinamos uma **Regressão Linear** (modelo paramétrico, alto viés, baixa variância) com um **Random Forest** (modelo não-paramétrico, baixo viés, alta variância). A média das previsões dos dois modelos tende a reduzir o erro total, pois os modelos tipicamente erram em dias diferentes e em direções opostas. A redução de erro segue a desigualdade:
+
+$$\text{MSE}_{\text{ensemble}} \leq \frac{1}{K}\sum_{k=1}^K \text{MSE}_k$$
+
+A igualdade só vale quando todos os modelos cometem exatamente os mesmos erros — cenário improvável quando os modelos têm estruturas distintas. Essa é a mesma lógica que torna o multi-model ensemble meteorológico superior a qualquer modelo individual.
+
+## Estrutura do Projeto
+
+O desafio deste projeto é utilizar uma **base de dados unificada** para construir no mínimo dois modelos: um de **aprendizado supervisionado** e outro **não-supervisionado**. Toda a análise utiliza uma **fonte única de dados: Open-Meteo ERA5 Reanalysis**, garantindo consistência metodológica entre as partes.
+
+| | **Parte I — Supervisionado** | **Parte II — Não-Supervisionado** |
+|---|---|---|
+| **Dados** | Open-Meteo ERA5 — São Paulo (diário) | Open-Meteo ERA5 — 12 cidades (diário → mensal) |
+| **Granularidade** | Diária | Mensal (agregação) |
+| **Alvo** | Temperatura de amanhã (`lead`) | Nenhum — descoberto |
+| **Modelos** | LM · RF · Ensemble · Quantile RF | PCA · K-Means · STL · ARIMA · ETS |
+| **Métrica** | RMSE · MAE · R² | Variância explicada · RMSE de forecast |
+
+A pergunta central de cada parte é diferente:
+
+- **Supervisionado:** *"Consigo prever a temperatura de amanhã com base nos padrões de hoje?"*
+- **Não-supervisionado:** *"Existem zonas climáticas naturais no Brasil? Qual estrutura temporal caracteriza cada cidade?"*
+
+Além disso, investigamos duas questões complementares:
+
+- **Aquecimento:** *"São Paulo está esquentando ao longo dos anos?"*
+- **Dinâmica dos clusters:** *"As zonas climáticas estão mudando ao longo do tempo?"*
+
+---
+
+# Parte I — Abordagem Supervisionada
+
+## Dados — Open-Meteo (ERA5, São Paulo, Diário)
+
+### Carregamento dos Dados
+
+Os dados foram pré-coletados do **Open-Meteo ERA5** via o script `fetch_data.py` e salvos localmente. A série cobre São Paulo de 1980 a 2024 com 6 variáveis diárias — 45 anos de histórico (era pós-satélite, quando a qualidade da reanálise ERA5 se torna substancialmente mais confiável).
+
+::: {.callout-tip}
+**Para atualizar os dados**, execute `python fetch_data.py` no terminal. O script busca dados do Open-Meteo ERA5 em **janelas de 2 anos** por cidade, salvando cada chunk individualmente em `data/chunks/`. Pode ser interrompido a qualquer momento (Ctrl+C) e re-executado — chunks já baixados são pulados automaticamente. Ao final, combina tudo em `data/sp_daily.csv` e `data/brazil_monthly.csv`, reportando quais cidades foram carregadas com sucesso.
+
+Flags adicionais:
+
+- `python fetch_data.py --combine` — apenas recombina os chunks existentes nos CSVs finais (sem novas requisições).
+- `python fetch_data.py --clean` — limpa cache (`data/chunks/`) e CSVs e recomeça do zero.
+:::
+
+```{r fetch-sup}
+#| label: fetch-supervised
+
+n_cores <- max(1L, parallel::detectCores() - 1L)
+cl      <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+weather_df <- read_csv("data/sp_daily.csv", show_col_types = FALSE) |>
+  mutate(date = as.Date(date))
+
+cat("Registros:", nrow(weather_df),
+    "| Período:", format(min(weather_df$date)),
+    "→", format(max(weather_df$date)), "\n")
+glimpse(weather_df)
+```
+
+
+
+### Estrutura do Dataset
+
+| Coluna | Unidade | Descrição |
+|--------|---------|-----------|
+| `date` | — | Data (1980-01-01 a 2024-12-31) |
+| `temp_max` | °C | Temperatura máxima diária |
+| `temp_min` | °C | Temperatura mínima diária |
+| `temp_mean` | °C | Temperatura média diária |
+| `precip` | mm | Precipitação acumulada no dia |
+| `wind_max` | km/h | Velocidade máxima do vento (10m) |
+| `radiation` | MJ/m² | Radiação solar de ondas curtas |
+
+## Análise Exploratória
+
+### Séries de temperatura
+
+```{r plot-sup-ts}
+#| label: fig-sup-ts
+#| fig-cap: "Temperatura diária de São Paulo (1980–2024). O ciclo sazonal anual é claro — verão (dez–mar) com picos acima de 30°C, inverno (jun–ago) com mínimas abaixo de 10°C."
+
+weather_df |>
+  select(date, temp_max, temp_min, temp_mean) |>
+  pivot_longer(-date, names_to = "serie", values_to = "valor") |>
+  ggplot(aes(date, valor, color = serie)) +
+  geom_line(alpha = 0.55, linewidth = 0.4) +
+  scale_color_manual(
+    values = c(temp_max = "#E8583E", temp_mean = "#6B7280", temp_min = "#3B82F6"),
+    labels = c("Máxima", "Média", "Mínima")
+  ) +
+  labs(title    = "Temperatura Diária — São Paulo (1980–2024)",
+       subtitle = "Fonte: Open-Meteo / ERA5 Reanalysis",
+       x = NULL, y = "Temperatura (°C)", color = NULL) +
+  theme_minimal(base_size = 13)
+
+```
+
+### Sazonalidade mensal e correlações
+
+```{r plot-sup-eda}
+#| fig-height: 5
+
+p_box <- weather_df |>
+  mutate(mes = month(date, label = TRUE)) |>
+  ggplot(aes(mes, temp_mean)) +
+  geom_boxplot(fill = "#3B82F6", alpha = 0.55, outlier.alpha = 0.3) +
+  labs(title = "Temperatura por Mês", x = NULL, y = "°C") +
+  theme_minimal(base_size = 12)
+
+p_box
+```
+
+
+
+```{r pairplot-sup}
+#| label: fig-pairplot-sup
+#| fig-height: 7
+#| fig-cap: "Matriz de correlação entre as 5 features. A alta correlação temp_max × temp_min justifica o uso de PCA — componentes ortogonais eliminam redundância e reduzem multicolinearidade."
+
+weather_df |>
+  select(temp_max, temp_min, precip, wind_max, radiation) |>
+  ggpairs(
+    columnLabels = c("T.max", "T.min", "Precip.", "Vento", "Radiação"),
+    lower  = list(continuous = wrap("smooth", alpha = 0.15)),
+    upper  = list(continuous = wrap("cor", size = 4)),
+    title  = "Correlações entre Variáveis Meteorológicas"
+  ) +
+  theme_minimal(base_size = 11)
+
+```
+
+## Split Cronológico — Treino / Teste
+
+::: {.callout-warning}
+**Regra inegociável em séries temporais:** nunca usar split aleatório. Dados futuros no treino causam **data leakage** — o modelo "vê o futuro" e produz métricas artificialmente boas que não se traduzem em produção.
+:::
+
+```{r split-sup}
+cutoff <- as.Date("2023-01-01")
+
+train_raw <- weather_df |> filter(date <  cutoff)
+test_raw  <- weather_df |> filter(date >= cutoff)
+
+cat(sprintf("Treino: %d dias | %s → %s\n",
+            nrow(train_raw), min(train_raw$date), max(train_raw$date)))
+cat(sprintf("Teste:  %d dias | %s → %s\n",
+            nrow(test_raw),  min(test_raw$date),  max(test_raw$date)))
+```
+
+
+
+## Escala com Estatísticas do Treino
+
+Média e desvio-padrão são calculados **exclusivamente no treino** e aplicados ao teste. Usar estatísticas do dataset completo vazaria informação do período de teste para o escalonamento do treino.
+
+```{r scale-sup}
+feature_cols <- c("temp_max", "temp_min", "precip", "wind_max", "radiation")
+
+scale_center <- colMeans(train_raw[feature_cols])
+scale_sd     <- apply(train_raw[feature_cols], 2, sd)
+
+X_train <- scale(train_raw[feature_cols], center = scale_center, scale = scale_sd)
+X_test  <- scale(test_raw[feature_cols],  center = scale_center, scale = scale_sd)
+
+data.frame(Media = round(scale_center, 2), DP = round(scale_sd, 2)) |>
+  knitr::kable(caption = "Parâmetros de escala — calculados apenas no treino")
+
+```
+
+## PCA — Ajustado no Treino, Aplicado no Teste
+
+```{r pca-sup}
+pca_sup <- prcomp(X_train, center = FALSE, scale. = FALSE)
+
+cat("Variância acumulada por componente:\n")
+var_exp <- cumsum(pca_sup$sdev^2) / sum(pca_sup$sdev^2)
+print(round(var_exp, 4))
+
+cat("\nMatriz de Cargas (Phi):\n")
+print(round(pca_sup$rotation, 3))
+```
+
+
+
+```{r scree-sup}
+#| label: fig-scree-sup
+#| fig-cap: "Scree plot: PC1 e PC2 capturam tipicamente >85% da variância. Os 3 primeiros componentes são usados como features."
+
+fviz_eig(pca_sup, addlabels = TRUE, ylim = c(0, 75),
+         barfill = "#3B82F6", linecolor = "#E8583E") +
+  labs(title = "Variância Explicada por Componente",
+       x = "Componente", y = "% de variância") +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r loadings-sup}
+#| label: fig-loadings-sup
+#| fig-cap: "Cargas dos PCs: PC1 captura o eixo calor seco (temp alta + radiação alta − precipitação); PC2 captura variabilidade residual dominada pelo vento."
+
+fviz_pca_var(pca_sup, repel = TRUE,
+             col.var       = "contrib",
+             gradient.cols = c("#00AFBB","#E7B800","#FC4E07"),
+             title = "Contribuição das Variáveis Meteorológicas aos PCs") +
+  theme_minimal(base_size = 13)
+```
+
+
+
+::: {.callout-tip}
+**Por que ajustar o PCA apenas no treino?** O PCA aprende uma matriz de rotação `Phi`. Se for ajustado no dataset completo, os autovetores são influenciados pelos padrões do período de teste — leakage sutil mas real. `predict(pca_sup, X_test)` aplica a rotação aprendida no treino aos dados de teste sem reajustar nenhum parâmetro.
+:::
+
+## Projeção e Engenharia de Features
+
+```{r project-sup}
+Z_train <- as.data.frame(predict(pca_sup, X_train))
+Z_test  <- as.data.frame(predict(pca_sup, X_test))
+
+# Unir cronologicamente ANTES de criar lags
+# (garante que os lags no início do teste usem os últimos dias do treino)
+Z_all <- bind_rows(
+  Z_train |> mutate(date = train_raw$date, temp_mean = train_raw$temp_mean,
+                    temp_max = train_raw$temp_max),
+  Z_test  |> mutate(date = test_raw$date,  temp_mean = test_raw$temp_mean,
+                    temp_max = test_raw$temp_max)
+) |> arrange(date)
+
+```
+
+```{r features-sup}
+n_pcs <- 3
+
+Z_model <- Z_all |>
+  mutate(
+    across(
+      paste0("PC", seq_len(n_pcs)),
+      list(lag1 = \(x) lag(x, 1), lag7 = \(x) lag(x, 7)),
+      .names = "{.col}_{.fn}"
+    ),
+    temp_lag1 = lag(temp_mean, 1),
+    month     = month(date),
+    doy       = yday(date),
+    target    = lead(temp_mean, 1)   # temperatura de AMANHÃ
+  ) |>
+  drop_na()
+
+feat_names <- setdiff(names(Z_model),
+                      c("date","temp_mean","temp_max","target",
+                        paste0("PC", seq_len(n_pcs))))
+
+cat("Features do modelo:\n")
+print(feat_names)
+cat("\nTotal de observações:", nrow(Z_model), "\n")
+```
+
+
+
+| Feature | O que captura |
+|---------|--------------|
+| `PC1_lag1`, `PC2_lag1`, `PC3_lag1` | Padrão meteorológico de **ontem** |
+| `PC1_lag7`, `PC2_lag7`, `PC3_lag7` | Padrão de **uma semana atrás** |
+| `temp_lag1` | Temperatura média de **ontem** — preditor mais direto |
+| `month` | Sazonalidade mensal discreta |
+| `doy` | Dia do ano — curva sazonal suave |
+
+`target = lead(temp_mean, 1)` desloca a série 1 posição: na linha do dia $t$, o alvo é a temperatura do dia $t+1$.
+
+## Split Final e Métricas
+
+```{r split-final-sup}
+train_df <- Z_model |> filter(date <  cutoff)
+test_df  <- Z_model |> filter(date >= cutoff)
+
+cat(sprintf("Treino final: %d obs | Teste final: %d obs\n",
+            nrow(train_df), nrow(test_df)))
+
+rmse <- function(pred, real) sqrt(mean((pred - real)^2))
+mae  <- function(pred, real) mean(abs(pred - real))
+r2   <- function(pred, real) cor(pred, real)^2
+
+```
+
+| Métrica | Fórmula | Interpretação |
+|---------|---------|---------------|
+| **RMSE** | $\sqrt{\frac{1}{n}\sum(y_i-\hat y_i)^2}$ | Erro típico em °C — penaliza grandes erros |
+| **MAE** | $\frac{1}{n}\sum|y_i-\hat y_i|$ | Erro médio absoluto — robusto a outliers |
+| **R²** | $\text{cor}(y,\hat y)^2$ | Proporção da variância do alvo explicada |
+
+## Modelo 1 — Regressão Linear (Baseline)
+
+```{r lm-sup}
+lm_formula <- reformulate(feat_names, response = "target")
+lm_fit     <- lm(lm_formula, data = train_df)
+pred_lm    <- predict(lm_fit, newdata = test_df)
+
+cat(sprintf("LM  — RMSE: %.3f °C | MAE: %.3f °C | R²: %.4f\n",
+            rmse(pred_lm, test_df$target),
+            mae(pred_lm,  test_df$target),
+            r2(pred_lm,   test_df$target)))
+```
+
+
+
+A regressão linear é o **modelo de referência**: sem hiperparâmetros, sem risco de overfitting, totalmente interpretável pelos coeficientes. Um RMSE de 1.5–2.5 °C já é razoável para previsão de 1 dia à frente em clima tropical.
+
+## Modelo 2 — Random Forest (ranger)
+
+```{r rf-sup}
+model_cols <- c(feat_names, "target")
+
+rf_fit  <- ranger(target ~ .,
+                  data        = train_df |> select(all_of(model_cols)),
+                  num.trees   = 500,
+                  importance  = "impurity",
+                  num.threads = n_cores)
+pred_rf <- predict(rf_fit,
+                   data = test_df |> select(all_of(feat_names)))$predictions
+
+cat(sprintf("RF  — RMSE: %.3f °C | MAE: %.3f °C | R²: %.4f\n",
+            rmse(pred_rf, test_df$target),
+            mae(pred_rf,  test_df$target),
+            r2(pred_rf,   test_df$target)))
+
+```
+
+O Random Forest captura relações **não-lineares** — por exemplo, o efeito de `temp_lag1` no verão pode ser diferente do inverno sem interações explícitas na fórmula.
+
+## Modelo 3 — Ensemble (LM + RF)
+
+```{r ensemble-sup}
+pred_ens <- (pred_lm + pred_rf) / 2
+
+cat(sprintf("ENS — RMSE: %.3f °C | MAE: %.3f °C | R²: %.4f\n",
+            rmse(pred_ens, test_df$target),
+            mae(pred_ens,  test_df$target),
+            r2(pred_ens,   test_df$target)))
+```
+
+
+
+O ensemble cancela erros correlacionados negativamente entre LM e RF:
+
+$$\text{RMSE}_\text{ensemble} \leq \frac{\text{RMSE}_{LM} + \text{RMSE}_{RF}}{2}$$
+
+A igualdade só vale se os dois modelos erram nos mesmos dias — o que raramente ocorre.
+
+## Intervalos de Incerteza — Quantile RF
+
+```{r quantile-rf}
+rf_q <- ranger(target ~ .,
+               data        = train_df |> select(all_of(model_cols)),
+               num.trees   = 500,
+               quantreg    = TRUE,
+               num.threads = n_cores)
+
+q_pred <- predict(rf_q,
+                  data      = test_df |> select(all_of(feat_names)),
+                  type      = "quantiles",
+                  quantiles = c(0.10, 0.50, 0.90))$predictions
+
+colnames(q_pred) <- c("q10","q50","q90")
+
+coverage <- mean(test_df$target >= q_pred[,"q10"] &
+                   test_df$target <= q_pred[,"q90"])
+
+cat(sprintf("Cobertura 10%%–90%%: %.1f%% (esperado ~80%%)\n", coverage * 100))
+cat(sprintf("Amplitude média: %.2f °C\n",
+            mean(q_pred[,"q90"] - q_pred[,"q10"])))
+
+```
+
+Com `quantreg = TRUE`, o ranger armazena as distribuições de folha e produz **quantis de predição** — análogo ao spread de ensemble do ECMWF. O intervalo [q10, q90] deve conter ~80% dos valores reais para ser bem calibrado.
+
+## Resultados
+
+### Comparação de modelos
+
+```{r results-table}
+results_sup <- tibble(
+  Modelo = c("LM — PCs + lags", "RF — PCs + lags", "Ensemble (LM + RF)"),
+  RMSE   = c(rmse(pred_lm, test_df$target),
+             rmse(pred_rf, test_df$target),
+             rmse(pred_ens,test_df$target)),
+  MAE    = c(mae(pred_lm,  test_df$target),
+             mae(pred_rf,  test_df$target),
+             mae(pred_ens, test_df$target)),
+  R2     = c(r2(pred_lm,  test_df$target),
+             r2(pred_rf,  test_df$target),
+             r2(pred_ens, test_df$target))
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 4))) |>
+  arrange(RMSE)
+
+results_sup |>
+  knitr::kable(caption = "Métricas no conjunto de teste (2023–2024)")
+```
+
+```{r best-model-conclusion}
+#| echo: false
+#| results: asis
+
+best       <- results_sup |> slice_min(RMSE, n = 1)
+worst_rmse <- max(results_sup$RMSE)
+gain_pct   <- (worst_rmse - best$RMSE) / worst_rmse * 100
+
+# Justificativa contextual conforme o vencedor
+why <- dplyr::case_when(
+  grepl("Ensemble", best$Modelo) ~ paste0(
+    "O ensemble vence porque LM e RF erram em direções parcialmente independentes — ",
+    "a média cancela parte do ruído idiossincrático de cada modelo. ",
+    "Este é o mesmo princípio do multi-model ensemble meteorológico (IFS + GFS + ICON) ",
+    "que supera consistentemente qualquer modelo individual em previsão operacional."
+  ),
+  grepl("^RF", best$Modelo) ~ paste0(
+    "O Random Forest vence porque captura **não-linearidades** e **interações entre features** ",
+    "(p.ex. efeito conjunto de radiação alta + vento baixo) que a regressão linear ignora por construção. ",
+    "Em séries climáticas com sazonalidade marcada e regimes distintos, essa flexibilidade compensa ",
+    "o maior risco de variância."
+  ),
+  grepl("^LM", best$Modelo) ~ paste0(
+    "A regressão linear vence — sinal de que o problema, após o pré-processamento via PCA + lags, ",
+    "é essencialmente **linear nos componentes principais**. Quando isso acontece, o RF apenas ",
+    "introduz variância sem ganho de viés, e o LM (sem hiperparâmetros, totalmente interpretável) ",
+    "é a escolha tecnicamente correta — modelo mais simples que atinge o melhor erro."
+  ),
+  TRUE ~ ""
+)
+
+cat(sprintf(
+"::: {.callout-important}\n## Conclusão — melhor modelo supervisionado\n\nCom base nas métricas acima no conjunto de teste (2023–2024), o **%s** é o modelo de melhor desempenho, com **RMSE = %.3f °C**, **MAE = %.3f °C** e **R² = %.4f**. Isso representa uma redução de %.1f%% no RMSE em relação ao pior modelo da tabela.\n\n%s\n:::\n",
+  best$Modelo, best$RMSE, best$MAE, best$R2, gain_pct, why
+))
+```
+
+
+
+### Série temporal de previsão
+
+```{r plot-sup-forecast}
+#| label: fig-sup-forecast
+#| fig-cap: "Primeiros 90 dias de teste. A faixa azul é o intervalo de incerteza 10%–90% do Quantile RF. Espera-se que ~80% da linha preta (real) fique dentro da faixa."
+
+results_df <- test_df |>
+  select(date, target) |>
+  mutate(LM = pred_lm, RF = pred_rf, Ensemble = pred_ens,
+         q10 = q_pred[,"q10"], q90 = q_pred[,"q90"])
+
+results_df |>
+  slice_head(n = 90) |>
+  ggplot(aes(date)) +
+  geom_ribbon(aes(ymin = q10, ymax = q90), fill = "#3B82F6", alpha = 0.15) +
+  geom_line(aes(y = target,   color = "Real"),     linewidth = 1.0) +
+  geom_line(aes(y = Ensemble, color = "Ensemble"), linewidth = 0.8, linetype = "dashed") +
+  geom_line(aes(y = RF,       color = "RF"),       linewidth = 0.5, alpha = 0.7) +
+  scale_color_manual(values = c("Real"="#1F2937","Ensemble"="#E8583E","RF"="#3B82F6")) +
+  labs(title    = "Previsão de Temperatura — São Paulo (primeiros 90 dias de 2023)",
+       subtitle = "Faixa azul = intervalo de incerteza 10%–90% (Quantile RF)",
+       x = NULL, y = "Temperatura Média (°C)", color = "Modelo") +
+  theme_minimal(base_size = 13)
+
+```
+
+### Predito vs Real
+
+```{r plot-scatter-sup}
+#| label: fig-scatter-sup
+#| fig-height: 4
+#| fig-cap: "Scatter predito × real para os 3 modelos. Pontos na diagonal = predição perfeita. Dispersão fora da diagonal = erros."
+
+results_df |>
+  pivot_longer(c(LM, RF, Ensemble), names_to = "Modelo", values_to = "Predito") |>
+  ggplot(aes(target, Predito, color = Modelo)) +
+  geom_point(alpha = 0.2, size = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~Modelo) +
+  scale_color_manual(values = c("#6B7280","#E8583E","#3B82F6")) +
+  labs(title = "Predito vs Real — Temperatura Amanhã (°C)",
+       subtitle = "Diagonal = predição perfeita",
+       x = "Real (°C)", y = "Previsto (°C)") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+
+
+### Resíduos e importância das features
+
+```{r residuos-sup}
+#| label: fig-residuos
+#| fig-height: 4
+
+results_df |>
+  mutate(residuo = Ensemble - target) |>
+  ggplot(aes(date, residuo)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_line(alpha = 0.4, color = "#E8583E", linewidth = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = "#1F2937", linewidth = 0.9) +
+  labs(title = "Resíduos do Ensemble ao longo do tempo",
+       subtitle = "Loess suave — ideal próximo de zero sem padrão temporal",
+       x = NULL, y = "Erro (°C): Previsto − Real") +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r importancia-sup}
+#| label: fig-importancia
+#| fig-height: 4
+#| fig-cap: "`temp_lag1` domina — temperatura tem alta autocorrelação. Os PCs de lag-1 vêm a seguir, resumindo o estado meteorológico recente."
+
+rf_fit$variable.importance |>
+  enframe(name = "Feature", value = "Importance") |>
+  arrange(desc(Importance)) |>
+  ggplot(aes(reorder(Feature, Importance), Importance, fill = Importance)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#93C5FD", high = "#1D4ED8") +
+  labs(title    = "Importância das Features — Random Forest",
+       subtitle = "Redução de variância nas 500 árvores (impurity)",
+       x = NULL, y = "Importância") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+
+
+```{r teardown-sup}
+stopCluster(cl)
+registerDoSEQ()
+cat("Cluster paralelo encerrado.\n")
+
+```
+
+---
+
+# Parte II — Abordagem Não-Supervisionada
+
+## Dados — Open-Meteo ERA5 (12 Cidades, Diário → Mensal)
+
+### Por que uma abordagem diferente?
+
+Na Parte I havia um **alvo claro** (temperatura de amanhã) e dados diários de um único ponto. Aqui não existe alvo — queremos descobrir estrutura intrínseca nos dados climáticos de múltiplas cidades, respondendo:
+
+> *Quais cidades têm perfis climáticos similares? Existem zonas climáticas naturais no Brasil?*
+
+Isso é **aprendizado não-supervisionado**: o PCA e o clustering são os modelos em si, não ferramentas intermediárias.
+
+### Carregamento — CSV pré-coletado
+
+Os dados foram coletados pelo script `fetch_data.py`, que busca dados diários do Open-Meteo ERA5 para cada cidade em janelas de 2 anos, persiste cada chunk em `data/chunks/` (permitindo retomada incremental após interrupção) e, na etapa de combinação, agrega tudo para resolução mensal. O CSV resultante é lido diretamente aqui.
+
+```{r cities-def}
+cities <- tribble(
+  ~city,             ~region,         ~lon,    ~lat,
+  "Manaus",          "Norte",        -60.02,  -3.10,
+  "Belém",           "Norte",        -48.48,  -1.46,
+  "Recife",          "Nordeste",     -34.88,  -8.05,
+  "Fortaleza",       "Nordeste",     -38.54,  -3.72,
+  "Salvador",        "Nordeste",     -38.51, -12.97,
+  "Brasília",        "Centro-Oeste", -47.93, -15.78,
+  "Cuiabá",          "Centro-Oeste", -56.10, -15.60,
+  "São Paulo",       "Sudeste",      -46.63, -23.55,
+  "Rio de Janeiro",  "Sudeste",      -43.18, -22.91,
+  "Belo Horizonte",  "Sudeste",      -43.94, -19.92,
+  "Porto Alegre",    "Sul",          -51.23, -30.03,
+  "Curitiba",        "Sul",          -49.27, -25.43
+)
+```
+
+
+
+```{r fetch-uns}
+#| label: fetch-unsupervised
+
+climate_df <- read_csv("data/brazil_monthly.csv", show_col_types = FALSE) |>
+  left_join(cities |> select(city, lon, lat), by = "city") |>
+  mutate(
+    date       = make_date(year, month, 1),
+    temp_range = temp_max - temp_min,
+    season     = case_when(
+      month %in% c(12,  1,  2) ~ "Verão",
+      month %in% c( 3,  4,  5) ~ "Outono",
+      month %in% c( 6,  7,  8) ~ "Inverno",
+      month %in% c( 9, 10, 11) ~ "Primavera"
+    ),
+    season = factor(season, levels = c("Verão","Outono","Inverno","Primavera"))
+  )
+
+cat(sprintf("Dataset: %d linhas | %d cidades | %d anos\n",
+            nrow(climate_df),
+            n_distinct(climate_df$city),
+            n_distinct(climate_df$year)))
+
+loaded_cities <- unique(climate_df$city)
+missing_cities <- setdiff(cities$city, loaded_cities)
+if (length(missing_cities) > 0) {
+  cat("⚠ Cidades não carregadas:", paste(missing_cities, collapse = ", "), "\n")
+} else {
+  cat("✓ Todas as 12 cidades presentes no CSV.\n")
+}
+
+glimpse(climate_df)
+
+```
+
+::: {.callout-note}
+**Pipeline de dados separado:** o script `fetch_data.py` coleta dados diários do Open-Meteo ERA5 para as 12 cidades em chunks de 2 anos (cache incremental em `data/chunks/`), agrega para resolução mensal (média para temperaturas, soma para precipitação) e salva em `data/brazil_monthly.csv`. Isso garante que o QMD renderiza em segundos sem depender de chamadas de API.
+:::
+
+## Análise Exploratória Multi-Cidades
+
+```{r plot-uns-ts}
+#| label: fig-uns-ts
+#| fig-height: 8
+#| fig-cap: "Séries de temperatura e precipitação para 5 cidades representativas. Note a amplitude térmica anual mínima em Manaus (Norte) vs máxima em Porto Alegre (Sul), e os picos de precipitação invertidos entre regiões."
+
+p_t <- climate_df |>
+  filter(city %in% c("Manaus","Recife","Brasília","São Paulo","Porto Alegre")) |>
+  ggplot(aes(date, temp, color = city)) +
+  geom_line(alpha = 0.7, linewidth = 0.6) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Temperatura Mensal — Brasil (Open-Meteo ERA5)",
+       x = NULL, y = "°C", color = "Cidade") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+p_p <- climate_df |>
+  filter(city %in% c("Manaus","Recife","Brasília","São Paulo","Porto Alegre")) |>
+  ggplot(aes(date, precip, color = city)) +
+  geom_line(alpha = 0.7, linewidth = 0.6) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Precipitação Mensal — Brasil (Open-Meteo ERA5)",
+       x = NULL, y = "mm/mês", color = "Cidade") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+p_t / p_p
+```
+
+
+
+```{r plot-seasonal}
+#| label: fig-seasonal
+#| fig-cap: "Ciclo sazonal médio por região. O Norte tem precipitação máxima no primeiro semestre (estação chuvosa amazônica); o Sul tem maior amplitude térmica anual."
+
+climate_df |>
+  group_by(region, month) |>
+  summarise(temp_m = mean(temp, na.rm = TRUE),
+            precip_m = mean(precip, na.rm = TRUE), .groups = "drop") |>
+  pivot_longer(c(temp_m, precip_m), names_to = "var") |>
+  mutate(var = recode(var, "temp_m" = "Temperatura (°C)",
+                      "precip_m" = "Precipitação (mm)")) |>
+  ggplot(aes(month, value, color = region, group = region)) +
+  geom_line(linewidth = 1.2) + geom_point(size = 2) +
+  facet_wrap(~var, scales = "free_y") +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = "Perfil Sazonal Médio por Região", x = "Mês", y = NULL, color = "Região") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+```
+
+## PCA Não-Supervisionado — Padrões Climáticos entre Cidades
+
+### Diferença conceitual em relação à Parte I
+
+Na Parte I, o PCA era uma **ferramenta** de redução de dimensionalidade a serviço de um alvo externo (temperatura amanhã). Aqui, o PCA **é o modelo** — o resultado final são os eixos de variação que separam climaticamente as 12 cidades.
+
+### Perfis médios por cidade
+
+```{r city-profiles}
+city_profiles <- climate_df |>
+  group_by(city, region) |>
+  summarise(
+    temp_mean  = mean(temp,       na.rm = TRUE),
+    temp_range = mean(temp_range, na.rm = TRUE),
+    precip     = mean(precip,     na.rm = TRUE),
+    radiation  = mean(radiation,  na.rm = TRUE),
+    wind       = mean(wind,       na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+city_profiles |>
+  select(-region) |>
+  mutate(across(where(is.numeric), ~round(., 1))) |>
+  knitr::kable(caption = "Perfil climático médio por cidade (1980–2024)")
+```
+
+
+
+### Padronização e ajuste do PCA
+
+```{r pca-uns}
+pca_data <- city_profiles |> column_to_rownames("city") |> select(-region)
+
+X_uns <- scale(pca_data, center = TRUE, scale = TRUE)
+
+pca_uns <- prcomp(X_uns)
+pca_uns$rotation <- -pca_uns$rotation
+pca_uns$x        <- -pca_uns$x
+
+cat("Variância acumulada:\n")
+print(round(cumsum(pca_uns$sdev^2) / sum(pca_uns$sdev^2), 3))
+
+cat("\nCargas (Phi) — 3 primeiros PCs:\n")
+print(round(pca_uns$rotation[, 1:3], 3))
+
+```
+
+A padronização (Z-score) é obrigatória: as variáveis têm unidades diferentes (°C, mm, MJ/m², m/s). Sem ela, o PCA seria dominado pela variável com maior variância absoluta.
+
+```{r biplot-uns}
+#| label: fig-biplot-uns
+#| fig-cap: "Biplot PCA: pontos = cidades (coloridas por região), setas = variáveis. PC1 separa Norte (quente, úmido) do Sul (temperado, seco relativo); PC2 distingue precipitação/radiação do vento."
+
+fviz_pca_biplot(
+  pca_uns, repel = TRUE,
+  col.ind      = city_profiles$region,
+  palette      = c("#E74C3C","#F39C12","#2ECC71","#3498DB","#9B59B6"),
+  addEllipses  = TRUE, ellipse.level = 0.70,
+  legend.title = "Região",
+  title = "PCA — Cidades Brasileiras por Perfil Climático",
+  xlab  = "PC1 (Temperatura / Sazonalidade)",
+  ylab  = "PC2 (Precipitação / Radiação)"
+) + theme_minimal(base_size = 13)
+```
+
+
+
+## Clustering — Zonas Climáticas Automáticas
+
+### Escolha do número de clusters
+
+```{r nbclust}
+#| label: fig-nbclust
+#| fig-height: 4
+#| fig-cap: "Critérios de escolha do k: elbow (joelho na curva WSS) e silhouette (máximo = melhor separação). Ambos tipicamente apontam k=3 para o Brasil."
+
+pc_scores <- as.data.frame(pca_uns$x[, 1:2])
+k_max <- min(8, nrow(pc_scores) - 1)
+
+p_elbow <- fviz_nbclust(pc_scores, kmeans, method = "wss", k.max = k_max) +
+  labs(title = "Método do Cotovelo") + theme_minimal(base_size = 12)
+
+p_silh  <- fviz_nbclust(pc_scores, kmeans, method = "silhouette", k.max = k_max) +
+  labs(title = "Silhouette") + theme_minimal(base_size = 12)
+
+p_elbow + p_silh
+
+```
+
+### K-Means (k = 3)
+
+```{r kmeans-uns}
+#| label: fig-kmeans-uns
+#| fig-cap: "K-Means com k=3 no espaço PC1 × PC2. Os 3 clusters correspondem tipicamente às zonas: tropical úmida (Norte), semiárida/cerrado (Nordeste/Centro-Oeste) e subtropical (Sul/Sudeste)."
+
+set.seed(42)
+k_centers <- min(3, nrow(pc_scores) - 1)
+km <- kmeans(pc_scores, centers = k_centers, nstart = 25)
+city_profiles$cluster <- as.factor(km$cluster)
+
+fviz_cluster(km, data = pc_scores,
+             palette = c("#E74C3C","#2ECC71","#3498DB"),
+             geom = "point", ellipse.type = "convex", pointsize = 4,
+             main = "Clusters de Zonas Climáticas — Brasil",
+             xlab = "PC1 (Temperatura)", ylab = "PC2 (Precipitação)") +
+  geom_text(aes(label = rownames(pc_scores)),
+            size = 3, vjust = -1, check_overlap = TRUE) +
+  theme_minimal(base_size = 13)
+```
+
+
+
+```{r cluster-profile}
+city_profiles |>
+  group_by(cluster) |>
+  summarise(
+    Cidades         = paste(city, collapse = ", "),
+    `Temp. Média`   = round(mean(temp_mean), 1),
+    `Precip. Média` = round(mean(precip), 1),
+    `Radiação Média` = round(mean(radiation), 1),
+    N = n(), .groups = "drop"
+  ) |>
+  knitr::kable(caption = "Perfil médio de cada zona climática (K-Means)")
+
+```
+
+### Clustering Hierárquico (Ward's)
+
+```{r hclust-uns}
+#| label: fig-hclust
+#| fig-cap: "Dendrograma Ward's: as caixas coloridas indicam o corte em k=3. O hierárquico não exige k a priori e é determinístico — ideal para validar o K-Means."
+
+dist_matrix <- dist(X_uns, method = "euclidean")
+hclust_res  <- hclust(dist_matrix, method = "ward.D2")
+
+plot(hclust_res, main = "Dendrograma — Cidades Brasileiras (Ward's method)",
+     xlab = "Cidade", ylab = "Distância", sub = "", cex = 0.9, hang = -1)
+rect.hclust(hclust_res, k = 3, border = c("red","green","blue"))
+```
+
+
+
+::: {.callout-tip}
+**K-Means vs Hierárquico:** K-Means é mais eficiente computacionalmente (essencial para n grande), mas requer k a priori e não é determinístico sem `set.seed`. Hierárquico é determinístico, permite visualizar a estrutura de fusão completa, mas tem complexidade O(n²) em memória — inviável para grandes datasets. Com 12 cidades, ambos são triviais; use os dois para cruzar a interpretação.
+:::
+
+## Decomposição de Séries Temporais
+
+```{r tsibble}
+# Garantir que não há duplicatas city+yearmonth antes da conversão
+climate_ts <- climate_df |>
+  mutate(yearmonth = yearmonth(date)) |>
+  group_by(city, yearmonth) |>
+  summarise(across(c(temp, temp_max, temp_min, precip, wind, radiation, temp_range),
+                   ~mean(.x, na.rm = TRUE)),
+            region = first(region),
+            season = first(season),
+            .groups = "drop") |>
+  as_tsibble(key = city, index = yearmonth) |>
+  fill_gaps() |>                         # preenche meses faltantes com NA
+  group_by_key() |>
+  tidyr::fill(temp, temp_max, temp_min, precip, wind, radiation,
+              temp_range, region, season, .direction = "downup") |>
+  ungroup()
+
+cat(sprintf("Tsibble: %d linhas | %d cidades | gaps preenchidos\n",
+            nrow(climate_ts), n_distinct(climate_ts$city)))
+cat(sprintf("NAs restantes em temp: %d\n", sum(is.na(climate_ts$temp))))
+
+```
+
+O `tsibble` é o formato exigido pelo `fable`: um tibble com índice temporal (`yearmonth`) e chave de série (`city`). O índice define a frequência — aqui mensal (12 por ano).
+
+### Decomposição STL — São Paulo
+
+**STL (Loess)** decompõe a série em:
+$$x_t = T_t + S_t + R_t$$
+
+onde $T_t$ é a tendência (suavizada por LOESS), $S_t$ é a sazonalidade e $R_t$ é o resíduo. Ao contrário da decomposição clássica, STL é robusto a outliers.
+
+```{r stl}
+#| label: fig-stl
+#| fig-height: 9
+#| fig-cap: "Decomposição STL de temperatura (acima) e precipitação (abaixo) em São Paulo. O componente de tendência revela aquecimento gradual; o resíduo na precipitação captura eventos extremos (El Niño, La Niña)."
+
+stl_t <- climate_ts |>
+  filter(city == "São Paulo") |>
+  model(STL(temp ~ trend(window = 13) + season(window = "periodic")))
+
+stl_p <- climate_ts |>
+  filter(city == "São Paulo") |>
+  model(STL(precip ~ trend(window = 13) + season(window = "periodic")))
+
+(stl_t |> components() |> autoplot() +
+   labs(title = "STL — Temperatura São Paulo") + theme_minimal(base_size = 12)) /
+(stl_p |> components() |> autoplot() +
+   labs(title = "STL — Precipitação São Paulo") + theme_minimal(base_size = 12))
+```
+
+
+
+### Features de séries — força de tendência e sazonalidade
+
+```{r ts-features}
+#| label: fig-ts-features
+#| fig-cap: "Força de tendência vs sazonalidade por cidade. Cidades tropicais (Norte) têm sazonalidade térmica fraca mas alta em precipitação. Cidades do Sul têm alta sazonalidade térmica."
+
+ts_features <- climate_ts |> features(temp, feat_stl)
+
+ts_features |>
+  left_join(select(cities, city, region), by = "city") |>
+  ggplot(aes(trend_strength, seasonal_strength_year,
+             color = region, label = city)) +
+  geom_point(size = 4) +
+  ggrepel::geom_text_repel(size = 3.5) +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = "Força de Tendência vs Sazonalidade — Temperatura",
+       x = "Força da Tendência", y = "Força da Sazonalidade", color = "Região") +
+  theme_minimal(base_size = 13)
+
+```
+
+## Forecasting com Séries Temporais — Modelos Não-Supervisionados
+
+Diferente da Parte I (que usou features externas + lag + ML), aqui cada modelo usa **apenas a história passada da série**. São modelos puramente univariados.
+
+```{r split-uns}
+sp_ts    <- climate_ts |> filter(city == "São Paulo")
+sp_train <- sp_ts |> filter(yearmonth <= yearmonth("2022 Dec"))
+sp_test  <- sp_ts |> filter(yearmonth >= yearmonth("2023 Jan"))
+
+cat(sprintf("Treino: %s → %s (%d meses)\n",
+            min(sp_train$yearmonth), max(sp_train$yearmonth), nrow(sp_train)))
+cat(sprintf("Teste:  %s → %s (%d meses)\n",
+            min(sp_test$yearmonth),  max(sp_test$yearmonth),  nrow(sp_test)))
+```
+
+
+
+### Temperatura — 5 modelos
+
+```{r models-temp}
+#| cache: true
+
+models_temp <- sp_train |>
+  model(
+    Naive_Sazonal = SNAIVE(temp),
+    Media_Hist    = MEAN(temp),
+    ETS           = ETS(temp),
+    ARIMA         = ARIMA(temp),
+    STL_ETS       = decomposition_model(
+      STL(temp ~ season(window = "periodic")), ETS(season_adjust)
+    )
+  )
+
+fc_temp  <- models_temp |> forecast(new_data = sp_test)
+acc_temp <- fc_temp |>
+  accuracy(sp_test) |>
+  select(.model, RMSE, MAE, MAPE, MASE) |>
+  arrange(RMSE)
+
+acc_temp |>
+  mutate(across(where(is.numeric), ~round(., 3))) |>
+  knitr::kable(caption = "Acurácia — Temperatura São Paulo (2023–2024)")
+
+```
+
+```{r plot-temp}
+#| label: fig-fc-temp
+#| fig-cap: "Previsões de temperatura com intervalo de 95% de confiança. STL+ETS e ARIMA tendem a superar o SNAIVE, que se limita a repetir o mesmo mês do ano anterior."
+
+fc_temp |>
+  autoplot(sp_ts |> filter(yearmonth >= yearmonth("2022 Jan")), level = 95) +
+  labs(title = "Comparação de Modelos — Temperatura São Paulo",
+       subtitle = "Treino 1980–2022 | Previsão 2023–2024",
+       x = NULL, y = "Temperatura (°C)") +
+  scale_color_brewer(palette = "Set2") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+
+
+| Modelo | Estratégia | Uso ideal |
+|--------|-----------|----------|
+| `SNAIVE` | Repete o mesmo mês do ano anterior | Baseline sazonal |
+| `MEAN` | Média histórica constante | Baseline não-sazonal |
+| `ETS` | Suavização exponencial adaptativa | Séries regulares |
+| `ARIMA` | Autoregressivo com diferenciação | Autocorrelação complexa |
+| `STL + ETS` | Decompõe sazonalidade, modela resíduo | Sazonalidade variável |
+
+### Precipitação — 5 modelos
+
+Precipitação exige transformação: distribuição assimétrica, cauda longa, não pode ser negativa.
+
+```{r models-precip}
+#| cache: true
+
+models_precip <- sp_train |>
+  model(
+    Naive_Sazonal = SNAIVE(precip),
+    Media_Hist    = MEAN(precip),
+    ETS_log       = ETS(log(precip + 1)),
+    ARIMA         = ARIMA(precip ~ pdq() + PDQ()),
+    STL_ETS       = decomposition_model(
+      STL(log(precip + 1) ~ season(window = "periodic")), ETS(season_adjust)
+    )
+  )
+
+fc_precip  <- models_precip |> forecast(new_data = sp_test)
+acc_precip <- fc_precip |>
+  accuracy(sp_test) |>
+  select(.model, RMSE, MAE, MAPE, MASE) |>
+  arrange(RMSE)
+
+acc_precip |>
+  mutate(across(where(is.numeric), ~round(., 3))) |>
+  knitr::kable(caption = "Acurácia — Precipitação São Paulo (2023–2024)")
+
+```
+
+### Heatmap RMSE — temperatura, múltiplas cidades
+
+```{r multi-city}
+#| cache: true
+
+cities_sub <- c("Manaus","Recife","Brasília","São Paulo","Porto Alegre")
+
+models_all <- climate_ts |>
+  filter(city %in% cities_sub, yearmonth <= yearmonth("2022 Dec")) |>
+  model(SNAIVE  = SNAIVE(temp),
+        ETS     = ETS(temp),
+        ARIMA   = ARIMA(temp),
+        STL_ETS = decomposition_model(
+          STL(temp ~ season(window = "periodic")), ETS(season_adjust)
+        ))
+
+acc_all <- models_all |>
+  forecast(new_data = climate_ts |>
+             filter(city %in% cities_sub, yearmonth >= yearmonth("2023 Jan"))) |>
+  accuracy(climate_ts |> filter(city %in% cities_sub,
+                                 yearmonth >= yearmonth("2023 Jan"))) |>
+  select(city, .model, RMSE, MAE) |>
+  arrange(city, RMSE)
+```
+
+
+
+```{r heatmap-temp}
+#| label: fig-heatmap-temp
+#| fig-height: 4
+#| fig-cap: "Heatmap de RMSE de temperatura por cidade × modelo. Verde = melhor performance. Um modelo com verde consistente em todas as cidades é mais robusto."
+
+acc_all |>
+  ggplot(aes(.model, city, fill = RMSE)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = round(RMSE, 2)), color = "white", fontface = "bold", size = 3.5) +
+  scale_fill_gradient(low = "#2ECC71", high = "#E74C3C") +
+  labs(title = "Heatmap RMSE — Temperatura por Cidade × Modelo",
+       subtitle = "Verde = melhor | Vermelho = pior",
+       x = "Modelo", y = "Cidade", fill = "RMSE (°C)") +
+  theme_minimal(base_size = 13)
+
+```
+
+---
+
+# Parte III — São Paulo Está Esquentando?
+
+Esta seção investiga se há evidência de **aquecimento ao longo dos 45 anos** no registro ERA5 de São Paulo. Usamos os dados diários da Parte I (mais granulares) e os mensais da Parte II para análises complementares.
+
+## Tendência de Temperatura Anual
+
+```{r warming-annual}
+#| label: fig-warming-annual
+#| fig-cap: "Temperatura média anual de São Paulo (1980–2024) com regressão linear e intervalo de confiança 95%. A inclinação da reta quantifica a taxa de aquecimento em °C/ano."
+
+annual_sp <- weather_df |>
+  mutate(year = year(date)) |>
+  group_by(year) |>
+  summarise(
+    temp_mean   = mean(temp_mean, na.rm = TRUE),
+    temp_max_m  = mean(temp_max,  na.rm = TRUE),
+    temp_min_m  = mean(temp_min,  na.rm = TRUE),
+    .groups     = "drop"
+  )
+
+# Regressão linear: temp ~ ano
+lm_trend <- lm(temp_mean ~ year, data = annual_sp)
+slope     <- coef(lm_trend)["year"]
+pval      <- summary(lm_trend)$coefficients["year", "Pr(>|t|)"]
+
+cat(sprintf("Taxa de aquecimento: %+.4f °C/ano → %+.3f °C/década\n",
+            slope, slope * 10))
+cat(sprintf("p-valor (H0: slope = 0): %.4f %s\n",
+            pval, ifelse(pval < 0.05, "→ significativo a 5%", "→ não-significativo")))
+
+ggplot(annual_sp, aes(year, temp_mean)) +
+  geom_point(size = 3, color = "#E8583E") +
+  geom_smooth(method = "lm", se = TRUE, color = "#1D4ED8",
+              fill = "#93C5FD", alpha = 0.3, linewidth = 1.2) +
+  labs(
+    title    = "São Paulo — Temperatura Média Anual (1980–2024)",
+    subtitle = sprintf("Tendência linear: %+.3f °C/década (p = %.4f)",
+                       slope * 10, pval),
+    x = "Ano", y = "Temperatura Média (°C)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+
+
+## Tendência Sazonal — Verão vs Inverno
+
+Nem todas as estações aquecem igualmente. Verificamos se o aquecimento é mais forte no verão (DJF) ou no inverno (JJA).
+
+```{r warming-seasonal}
+#| label: fig-warming-seasonal
+#| fig-height: 5
+#| fig-cap: "Tendência de temperatura por estação. Taxas de aquecimento distintas entre estações indicam mudanças na sazonalidade."
+
+seasonal_sp <- weather_df |>
+  mutate(
+    year = year(date),
+    season = case_when(
+      month(date) %in% c(12, 1, 2)  ~ "Verão (DJF)",
+      month(date) %in% c(3, 4, 5)   ~ "Outono (MAM)",
+      month(date) %in% c(6, 7, 8)   ~ "Inverno (JJA)",
+      month(date) %in% c(9, 10, 11) ~ "Primavera (SON)"
+    ),
+    season = factor(season, levels = c("Verão (DJF)", "Outono (MAM)",
+                                        "Inverno (JJA)", "Primavera (SON)"))
+  ) |>
+  group_by(year, season) |>
+  summarise(temp_mean = mean(temp_mean, na.rm = TRUE), .groups = "drop")
+
+# Calcular slope por estação
+slopes_season <- seasonal_sp |>
+  group_by(season) |>
+  summarise(
+    slope    = coef(lm(temp_mean ~ year))[2],
+    pval     = summary(lm(temp_mean ~ year))$coefficients[2, 4],
+    slope_10 = slope * 10,
+    .groups  = "drop"
+  )
+
+slopes_season |>
+  mutate(across(where(is.numeric), ~round(., 4))) |>
+  knitr::kable(caption = "Taxa de aquecimento por estação (°C/ano e °C/década)")
+
+ggplot(seasonal_sp, aes(year, temp_mean)) +
+  geom_point(alpha = 0.5, size = 1.5, color = "#6B7280") +
+  geom_smooth(method = "lm", se = TRUE, color = "#E8583E",
+              fill = "#FECACA", alpha = 0.3, linewidth = 1) +
+  facet_wrap(~season, scales = "free_y") +
+  labs(
+    title    = "Tendência de Aquecimento por Estação — São Paulo",
+    subtitle = "Regressão linear com IC 95% para cada estação",
+    x = "Ano", y = "Temperatura Média (°C)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+## Extremos Térmicos — Dias Quentes Estão Aumentando?
+
+Contamos o número anual de dias com temperatura máxima acima de 30 °C e 33 °C, e o número de noites quentes (mínima acima de 20 °C).
+
+```{r warming-extremes}
+#| label: fig-warming-extremes
+#| fig-height: 5
+#| fig-cap: "Evolução anual do número de dias de calor extremo. Um aumento na contagem indica que ondas de calor estão se tornando mais frequentes e/ou duradouras."
+
+extremes_sp <- weather_df |>
+  mutate(year = year(date)) |>
+  group_by(year) |>
+  summarise(
+    dias_30   = sum(temp_max >= 30, na.rm = TRUE),
+    dias_33   = sum(temp_max >= 33, na.rm = TRUE),
+    noites_20 = sum(temp_min >= 20, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+extremes_sp |>
+  pivot_longer(-year, names_to = "tipo", values_to = "contagem") |>
+  mutate(tipo = recode(tipo,
+    "dias_30"   = "Dias com Máx ≥ 30°C",
+    "dias_33"   = "Dias com Máx ≥ 33°C",
+    "noites_20" = "Noites com Mín ≥ 20°C"
+  )) |>
+  ggplot(aes(year, contagem, color = tipo)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", linewidth = 0.6) +
+  scale_color_manual(values = c("#E8583E", "#9B59B6", "#F39C12")) +
+  labs(
+    title    = "Extremos Térmicos Anuais — São Paulo (1980–2024)",
+    subtitle = "Tendência linear tracejada — contagem de dias acima de limiares",
+    x = "Ano", y = "Número de Dias", color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+
+
+## Tendência via STL — Componente de Tendência
+
+A decomposição STL da Parte II isola o componente de tendência eliminando sazonalidade e ruído.
+
+```{r warming-stl}
+#| label: fig-warming-stl
+#| fig-cap: "Componente de tendência STL da temperatura mensal. A tendência suavizada revela variações de longo prazo que a regressão linear anual pode suavizar excessivamente."
+
+stl_trend <- climate_ts |>
+  filter(city == "São Paulo") |>
+  model(STL(temp ~ trend(window = 25) + season(window = "periodic"))) |>
+  components()
+
+ggplot(stl_trend, aes(yearmonth, trend)) +
+  geom_line(linewidth = 1.2, color = "#1D4ED8") +
+  geom_smooth(method = "lm", se = TRUE, color = "#E8583E",
+              fill = "#FECACA", alpha = 0.3, linetype = "dashed") +
+  labs(
+    title    = "Componente de Tendência STL — Temperatura São Paulo",
+    subtitle = "Janela de tendência = 25 meses | Regressão linear sobreposta",
+    x = NULL, y = "Tendência (°C)"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+::: {.callout-note}
+**Resumo do aquecimento:** a combinação de regressão linear anual, análise por estação, contagem de extremos e decomposição STL oferece evidência multi-angular. O ERA5 mostra consistentemente um aquecimento modesto mas detectável em São Paulo ao longo de 1980–2024, com possíveis diferenças entre estações e aumento na frequência de dias de calor extremo. A janela ampliada (45 anos vs. 25 anteriormente) torna a tendência mais robusta estatisticamente.
+:::
+
+---
+
+# Parte IV — Os Clusters Estão Mudando ao Longo do Tempo?
+
+Uma das perguntas mais interessantes em climatologia: **a estrutura das zonas climáticas brasileiras é estável ou está se reconfigurando?** Dividimos os 45 anos em janelas temporais e aplicamos o mesmo pipeline PCA + K-Means em cada uma.
+
+## Perfis Climáticos por Período
+
+Dividimos os dados em 3 períodos de ~15 anos para captar mudanças graduais.
+
+```{r temporal-periods}
+climate_periods <- climate_df |>
+  mutate(
+    period = case_when(
+      year <= 1994 ~ "1980–1994",
+      year <= 2009 ~ "1995–2009",
+      TRUE         ~ "2010–2024"
+    ),
+    period = factor(period, levels = c("1980–1994", "1995–2009", "2010–2024"))
+  )
+
+# Perfis por cidade e período
+profiles_temporal <- climate_periods |>
+  group_by(city, region, period) |>
+  summarise(
+    temp_mean  = mean(temp,       na.rm = TRUE),
+    temp_range = mean(temp_range, na.rm = TRUE),
+    precip     = mean(precip,     na.rm = TRUE),
+    radiation  = mean(radiation,  na.rm = TRUE),
+    wind       = mean(wind,       na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+profiles_temporal |>
+  filter(city %in% c("Manaus", "São Paulo", "Porto Alegre", "Recife", "Brasília")) |>
+  select(city, period, temp_mean, precip, radiation) |>
+  mutate(across(where(is.numeric), ~round(., 1))) |>
+  knitr::kable(caption = "Evolução dos perfis climáticos por período (cidades selecionadas)")
+```
+
+
+
+## PCA e K-Means por Período
+
+Para cada janela temporal, ajustamos PCA e K-Means (k=3) nos perfis de cidade, depois comparamos os resultados.
+
+```{r temporal-clustering}
+#| label: fig-temporal-clusters
+#| fig-height: 5
+#| fig-cap: "Espaço PCA com K-Means (k=3) para cada período. Movimentação das cidades no espaço PCA indica mudanças no perfil climático relativo. Mudanças nas cores (cluster) indicam reclassificação de zona climática."
+
+run_period_clustering <- function(df, period_label) {
+  prof <- df |>
+    filter(period == period_label) |>
+    select(city, temp_mean, temp_range, precip, radiation, wind) |>
+    column_to_rownames("city")
+
+  X_s <- scale(prof)
+  pca_p <- prcomp(X_s)
+
+  pc2 <- as.data.frame(pca_p$x[, 1:2])
+  k <- min(3, nrow(pc2) - 1)
+  set.seed(42)
+  km_p <- kmeans(pc2, centers = k, nstart = 25)
+
+  pc2 |>
+    mutate(
+      city    = rownames(pc2),
+      cluster = as.factor(km_p$cluster),
+      period  = period_label
+    )
+}
+
+periods <- levels(profiles_temporal$period)
+
+pca_temporal <- map(periods, ~run_period_clustering(profiles_temporal, .x)) |>
+  list_rbind()
+
+ggplot(pca_temporal, aes(PC1, PC2, color = cluster, label = city)) +
+  geom_point(size = 4) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 15) +
+  facet_wrap(~period) +
+  scale_color_manual(values = c("#E74C3C", "#2ECC71", "#3498DB")) +
+  labs(
+    title    = "Evolução dos Clusters Climáticos — Brasil",
+    subtitle = "PCA + K-Means (k=3) por período de ~8 anos",
+    x = "PC1", y = "PC2", color = "Cluster"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+```
+
+## Estabilidade dos Clusters — Análise de Migração
+
+Verificamos quais cidades mudam de cluster entre períodos — indicando transição de zona climática.
+
+```{r cluster-migration}
+#| label: fig-cluster-migration
+#| fig-height: 5
+
+# Usar clustering hierárquico para consistência de labels entre períodos
+# (K-Means tem label-switching)
+run_hclust_period <- function(df, period_label) {
+  prof <- df |>
+    filter(period == period_label) |>
+    select(city, temp_mean, temp_range, precip, radiation, wind) |>
+    column_to_rownames("city")
+
+  X_s <- scale(prof)
+  d   <- dist(X_s, method = "euclidean")
+  hc  <- hclust(d, method = "ward.D2")
+  cl  <- cutree(hc, k = 3)
+
+  tibble(city = names(cl), cluster_h = cl, period = period_label)
+}
+
+hc_temporal <- map(periods, ~run_hclust_period(profiles_temporal, .x)) |>
+  list_rbind()
+
+# Tabela de migração
+migration <- hc_temporal |>
+  pivot_wider(names_from = period, values_from = cluster_h,
+              names_prefix = "cl_")
+
+migration |>
+  left_join(select(cities, city, region), by = "city") |>
+  select(city, region, everything()) |>
+  knitr::kable(caption = "Atribuição de cluster por período (Ward's, k=3). Mudanças de cluster indicam migração climática.")
+```
+
+
+
+```{r cluster-stability-plot}
+#| label: fig-cluster-stability
+#| fig-cap: "Trajetória de cada cidade no espaço de clusters ao longo do tempo. Cidades que mantêm o mesmo cluster são estáveis; mudanças indicam transição de zona climática."
+
+# Visualizar diferenças de perfil ao longo do tempo
+profiles_temporal |>
+  filter(city %in% c("Manaus", "Recife", "Brasília", "São Paulo",
+                      "Porto Alegre", "Curitiba", "Cuiabá", "Salvador")) |>
+  select(city, period, temp_mean, precip) |>
+  ggplot(aes(temp_mean, precip, color = period, label = city)) +
+  geom_point(size = 3.5) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 20) +
+  geom_path(aes(group = city), arrow = arrow(length = unit(0.15, "cm")),
+            alpha = 0.4, linewidth = 0.6, color = "gray40") +
+  scale_color_manual(values = c("#3B82F6", "#F59E0B", "#E8583E")) +
+  labs(
+    title    = "Trajetória Climática das Cidades — Temperatura vs Precipitação",
+    subtitle = "Setas conectam os 3 períodos para cada cidade",
+    x = "Temperatura Média (°C)", y = "Precipitação Média (mm/mês)",
+    color = "Período"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+```
+
+## Distância Intra-Cluster — Os Clusters Estão Ficando Mais Difusos?
+
+Calculamos o WSS (Within-cluster Sum of Squares) por período para verificar se a separação entre clusters está se alterando.
+
+```{r cluster-wss}
+#| label: fig-wss-temporal
+#| fig-cap: "WSS (compactação dos clusters) e Silhouette médio por período. WSS crescente = clusters menos compactos. Silhouette decrescente = pior separação."
+
+compute_cluster_quality <- function(df, period_label) {
+  prof <- df |>
+    filter(period == period_label) |>
+    select(city, temp_mean, temp_range, precip, radiation, wind) |>
+    column_to_rownames("city")
+
+  X_s <- scale(prof)
+  k <- min(3, nrow(X_s) - 1)
+  set.seed(42)
+  km <- kmeans(X_s, centers = k, nstart = 25)
+
+  sil <- silhouette(km$cluster, dist(X_s))
+  tibble(
+    period   = period_label,
+    wss      = km$tot.withinss,
+    sil_mean = mean(sil[, "sil_width"])
+  )
+}
+
+quality_temporal <- map(periods, ~compute_cluster_quality(profiles_temporal, .x)) |>
+  list_rbind()
+
+p_wss <- ggplot(quality_temporal, aes(period, wss, group = 1)) +
+  geom_line(linewidth = 1.2, color = "#E8583E") +
+  geom_point(size = 4, color = "#E8583E") +
+  labs(title = "WSS (Compactação)", x = NULL, y = "Within-cluster SS") +
+  theme_minimal(base_size = 12)
+
+p_sil <- ggplot(quality_temporal, aes(period, sil_mean, group = 1)) +
+  geom_line(linewidth = 1.2, color = "#3B82F6") +
+  geom_point(size = 4, color = "#3B82F6") +
+  labs(title = "Silhouette Médio", x = NULL, y = "Silhouette") +
+  theme_minimal(base_size = 12)
+
+p_wss + p_sil
+
+quality_temporal |>
+  mutate(across(where(is.numeric), ~round(., 3))) |>
+  knitr::kable(caption = "Métricas de qualidade dos clusters por período")
+```
+
+
+
+::: {.callout-note}
+**Interpretação da dinâmica dos clusters:** se o WSS aumenta e o Silhouette diminui ao longo dos períodos, os perfis climáticos estão se tornando mais homogêneos entre regiões — o que poderia indicar convergência climática (possivelmente ligada ao aquecimento global). Se uma cidade específica muda de cluster, isso sugere que seu microclima está se deslocando em relação aos vizinhos geográficos. A trajetória no espaço Temperatura × Precipitação mostra a direção e magnitude dessas mudanças.
+:::
+
+---
+
+# Parte V — Exercícios Implementados
+
+## Exercício 1 — Target Alternativo: Prever `temp_max`
+
+Em vez de prever a temperatura **média** de amanhã, prevemos a temperatura **máxima**. É uma tarefa mais difícil: a máxima é mais sensível a eventos de calor extremo e tem maior variância intra-anual.
+
+```{r ex1-target-max}
+Z_model_max <- Z_all |>
+  mutate(
+    across(paste0("PC", seq_len(n_pcs)),
+           list(lag1 = \(x) lag(x, 1), lag7 = \(x) lag(x, 7)),
+           .names = "{.col}_{.fn}"),
+    temp_lag1  = lag(temp_mean, 1),
+    month      = month(date),
+    doy        = yday(date),
+    target_max = lead(temp_max, 1)   # MÁXIMA de amanhã
+  ) |>
+  drop_na()
+
+feat_names_ex <- setdiff(names(Z_model_max),
+                         c("date","temp_mean","temp_max",
+                           "target_max", paste0("PC", seq_len(n_pcs))))
+
+train_max <- Z_model_max |> filter(date <  cutoff)
+test_max  <- Z_model_max |> filter(date >= cutoff)
+
+# LM
+lm_max  <- lm(reformulate(feat_names_ex, "target_max"), data = train_max)
+pred_lm_max <- predict(lm_max, newdata = test_max)
+
+# RF
+n_cores2 <- max(1L, parallel::detectCores() - 1L)
+rf_max <- ranger(target_max ~ .,
+                 data = train_max |> select(all_of(c(feat_names_ex, "target_max"))),
+                 num.trees = 500, importance = "impurity", num.threads = n_cores2)
+pred_rf_max  <- predict(rf_max, data = test_max |> select(all_of(feat_names_ex)))$predictions
+pred_ens_max <- (pred_lm_max + pred_rf_max) / 2
+
+tibble(
+  Modelo = c("LM", "RF", "Ensemble"),
+  Target = "temp_max",
+  RMSE   = c(rmse(pred_lm_max,  test_max$target_max),
+             rmse(pred_rf_max,  test_max$target_max),
+             rmse(pred_ens_max, test_max$target_max)),
+  MAE    = c(mae(pred_lm_max,  test_max$target_max),
+             mae(pred_rf_max,  test_max$target_max),
+             mae(pred_ens_max, test_max$target_max)),
+  R2     = c(r2(pred_lm_max,  test_max$target_max),
+             r2(pred_rf_max,  test_max$target_max),
+             r2(pred_ens_max, test_max$target_max))
+) |>
+  mutate(across(where(is.numeric), ~round(., 4))) |>
+  knitr::kable(caption = "Exercício 1: Métricas para previsão de temp_max (vs temp_mean original)")
+
+```
+
+::: {.callout-note}
+**O que esperar:** o RMSE para `temp_max` tipicamente supera o de `temp_mean` — a máxima tem maior variância e é mais influenciada por condições locais transitórias (rajadas, nuvens isoladas) que os PCs não capturam tão bem. O R² deve ser similar ou ligeiramente menor.
+:::
+
+## Exercício 2 — Lags de Ordem Superior (lag-14)
+
+Adicionamos `lag14` (duas semanas atrás) às features e comparamos o RMSE com o modelo original da Parte I.
+
+```{r ex2-lag14}
+Z_model_l14 <- Z_all |>
+  mutate(
+    across(paste0("PC", seq_len(n_pcs)),
+           list(lag1  = \(x) lag(x, 1),
+                lag7  = \(x) lag(x, 7),
+                lag14 = \(x) lag(x, 14)),
+           .names = "{.col}_{.fn}"),
+    temp_lag1  = lag(temp_mean, 1),
+    temp_lag14 = lag(temp_mean, 14),
+    month      = month(date),
+    doy        = yday(date),
+    target     = lead(temp_mean, 1)
+  ) |>
+  drop_na()
+
+feat_l14 <- setdiff(names(Z_model_l14),
+                    c("date","temp_mean","temp_max","target",
+                      paste0("PC", seq_len(n_pcs))))
+
+train_l14 <- Z_model_l14 |> filter(date <  cutoff)
+test_l14  <- Z_model_l14 |> filter(date >= cutoff)
+
+rf_l14 <- ranger(target ~ .,
+                 data = train_l14 |> select(all_of(c(feat_l14, "target"))),
+                 num.trees = 500, importance = "impurity", num.threads = n_cores2)
+pred_rf_l14 <- predict(rf_l14, data = test_l14 |> select(all_of(feat_l14)))$predictions
+
+tibble(
+  Modelo      = c("RF (lag1 + lag7)", "RF (lag1 + lag7 + lag14)"),
+  `Nº features` = c(length(feat_names), length(feat_l14)),
+  RMSE        = c(rmse(pred_rf, test_df$target),
+                  rmse(pred_rf_l14, test_l14$target)),
+  MAE         = c(mae(pred_rf,     test_df$target),
+                  mae(pred_rf_l14, test_l14$target)),
+  R2          = c(r2(pred_rf,     test_df$target),
+                  r2(pred_rf_l14, test_l14$target))
+) |>
+  mutate(across(where(is.numeric), ~round(., 4))) |>
+  knitr::kable(caption = "Exercício 2: Impacto do lag-14 no RMSE do Random Forest")
+```
+
+
+
+::: {.callout-note}
+**Interpretação:** se o lag-14 melhorar o RMSE, há persistência de padrões a 2 semanas (plausível para ondas de calor ou bloqueios atmosféricos). Se não melhorar, o Random Forest já capturou indiretamente essa informação via lag-7 + autocorrelação dos PCs.
+:::
+
+## Exercício 3 — Precipitação no Heatmap Multi-Cidades
+
+Repetimos a análise da Seção 2.8 para **precipitação**, verificando se o ranking de modelos muda com uma variável mais difícil de prever.
+
+```{r ex3-precip-heatmap}
+#| cache: true
+
+models_precip_all <- climate_ts |>
+  filter(city %in% cities_sub, yearmonth <= yearmonth("2022 Dec")) |>
+  model(
+    Naive_Sazonal = SNAIVE(precip),
+    ETS_log       = ETS(log(precip + 1)),
+    ARIMA         = ARIMA(precip ~ pdq() + PDQ()),
+    STL_ETS       = decomposition_model(
+      STL(log(precip + 1) ~ season(window = "periodic")), ETS(season_adjust)
+    )
+  )
+
+acc_precip_all <- models_precip_all |>
+  forecast(new_data = climate_ts |>
+             filter(city %in% cities_sub, yearmonth >= yearmonth("2023 Jan"))) |>
+  accuracy(climate_ts |> filter(city %in% cities_sub,
+                                 yearmonth >= yearmonth("2023 Jan"))) |>
+  select(city, .model, RMSE, MAE) |>
+  arrange(city, RMSE)
+
+```
+
+```{r ex3-plot}
+#| label: fig-ex3
+#| fig-height: 4
+#| fig-cap: "Heatmap RMSE para precipitação. Compare com o heatmap de temperatura: os valores de RMSE são maiores e o ranking entre modelos costuma ser diferente — precipitação é inerentemente mais difícil de prever."
+
+acc_precip_all |>
+  ggplot(aes(.model, city, fill = RMSE)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = round(RMSE, 1)), color = "white", fontface = "bold", size = 3.5) +
+  scale_fill_gradient(low = "#2ECC71", high = "#E74C3C") +
+  labs(title = "Heatmap RMSE — Precipitação por Cidade × Modelo",
+       subtitle = "Exercício 3: compare com o heatmap de temperatura",
+       x = "Modelo", y = "Cidade", fill = "RMSE (mm)") +
+  theme_minimal(base_size = 13)
+```
+
+
+---
+
+# Conclusões Gerais
+
+## Supervisionado vs Não-Supervisionado em dados climáticos
+
+| | **Supervisionado (Parte I)** | **Não-Supervisionado (Parte II)** |
+|---|---|---|
+| **Pergunta** | Quanto vai ser amanhã? | Quais cidades são similares? |
+| **PCA** | Redução de dimensionalidade para features | Modelo em si — eixos de variação |
+| **Validação** | RMSE / R² no conjunto de teste | Variância explicada / Silhouette |
+| **Melhor modelo** | Ensemble LM + RF | STL + ETS (mais robusto entre cidades) |
+| **Dados necessários** | Série densa de um ponto (diário) | Múltiplos pontos, menor densidade |
+
+## Principais aprendizados
+
+1. **Leakage tem três camadas em séries temporais:** split cronológico, escala com parâmetros do treino, PCA ajustado no treino. Violar qualquer uma infla artificialmente as métricas.
+
+2. **PCA muda de papel entre supervisionado e não-supervisionado:** no primeiro, é pré-processamento; no segundo, é o modelo final.
+
+3. **Temperatura é muito mais previsível que precipitação:** alta autocorrelação serial e sazonalidade regular tornam o RMSE de temperatura < 2 °C viável com modelos simples. Precipitação, por sua distribuição assimétrica e eventos extremos, resiste a modelos univariados.
+
+4. **Ensembles são seguros:** combinar LM + RF quase sempre não piora — e frequentemente melhora — porque os dois modelos erram em dias diferentes.
+
+5. **São Paulo está aquecendo:** a análise multi-angular (regressão anual, decomposição sazonal, contagem de extremos, STL) confirma uma tendência de aquecimento ao longo de 1980–2024. A magnitude e significância dependem da métrica utilizada, mas a direção é consistente.
+
+6. **Clusters climáticos não são estáticos:** a análise temporal revela que os perfis climáticos relativos das cidades se deslocam ao longo dos 45 anos. Algumas cidades podem migrar entre zonas climáticas, e a qualidade da separação entre clusters (WSS / Silhouette) pode se alterar — evidência de que as mudanças climáticas afetam não apenas médias, mas a própria estrutura de agrupamento regional.
+
+7. **Fonte única = consistência:** usar o Open-Meteo ERA5 para ambas as partes elimina discrepâncias de grade e pós-processamento. A agregação diário → mensal é transparente e reprodutível.
