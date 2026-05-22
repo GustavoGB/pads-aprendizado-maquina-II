@@ -38,6 +38,7 @@ library(feasts)
 library(fabletools)
 library(ranger)
 library(doParallel)
+library(plotly)
 
 ```
 
@@ -699,56 +700,107 @@ glimpse(climate_df)
 
 ```{r plot-uns-ts}
 #| label: fig-uns-ts
-#| fig-height: 8
-#| fig-cap: "Séries de temperatura e precipitação para 5 cidades representativas. Note a amplitude térmica anual mínima em Manaus (Norte) vs máxima em Porto Alegre (Sul), e os picos de precipitação invertidos entre regiões."
+#| fig-cap: "Séries de temperatura e precipitação para 5 cidades representativas. Passe o mouse sobre as linhas para ver valores exatos. Use a legenda para mostrar/ocultar cidades."
+
+cities_sel <- c("Manaus","Recife","Brasília","São Paulo","Porto Alegre")
+pal_set2   <- RColorBrewer::brewer.pal(5, "Set2")
 
 p_t <- climate_df |>
-  filter(city %in% c("Manaus","Recife","Brasília","São Paulo","Porto Alegre")) |>
-  ggplot(aes(date, temp, color = city)) +
-  geom_line(alpha = 0.7, linewidth = 0.6) +
-  scale_color_brewer(palette = "Set2") +
-  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  filter(city %in% cities_sel) |>
+  ggplot(aes(date, temp, color = city,
+             text = paste0(city, "<br>", format(date, "%b %Y"),
+                           "<br>Temp: ", round(temp, 1), " °C"))) +
+  geom_line(alpha = 0.8, linewidth = 0.5) +
+  scale_color_manual(values = setNames(pal_set2, cities_sel)) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
   labs(title = "Temperatura Mensal — Brasil (Open-Meteo ERA5)",
        x = NULL, y = "°C", color = "Cidade") +
   theme_minimal(base_size = 12) +
   theme(legend.position = "bottom")
 
 p_p <- climate_df |>
-  filter(city %in% c("Manaus","Recife","Brasília","São Paulo","Porto Alegre")) |>
-  ggplot(aes(date, precip, color = city)) +
-  geom_line(alpha = 0.7, linewidth = 0.6) +
-  scale_color_brewer(palette = "Set2") +
-  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  filter(city %in% cities_sel) |>
+  ggplot(aes(date, precip, color = city,
+             text = paste0(city, "<br>", format(date, "%b %Y"),
+                           "<br>Precip: ", round(precip, 1), " mm"))) +
+  geom_line(alpha = 0.8, linewidth = 0.5) +
+  scale_color_manual(values = setNames(pal_set2, cities_sel)) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
   labs(title = "Precipitação Mensal — Brasil (Open-Meteo ERA5)",
        x = NULL, y = "mm/mês", color = "Cidade") +
   theme_minimal(base_size = 12) +
   theme(legend.position = "bottom")
 
-p_t / p_p
+subplot(
+  ggplotly(p_t, tooltip = "text") |> layout(showlegend = TRUE),
+  ggplotly(p_p, tooltip = "text") |> layout(showlegend = FALSE),
+  nrows = 2, shareX = TRUE, titleY = TRUE, heights = c(0.5, 0.5)
+) |>
+  layout(
+    title = list(text = "Temperatura e Precipitação Mensais — 5 Cidades Representativas",
+                 font = list(size = 14)),
+    margin = list(t = 60)
+  )
 ```
 
 
 
 ```{r plot-seasonal}
 #| label: fig-seasonal
-#| fig-cap: "Ciclo sazonal médio por região. O Norte tem precipitação máxima no primeiro semestre (estação chuvosa amazônica); o Sul tem maior amplitude térmica anual."
+#| fig-cap: "Ciclo sazonal médio por região. Passe o mouse sobre os pontos para ver valores. Clique nas regiões na legenda para mostrar/ocultar."
 
-climate_df |>
+seasonal_long <- climate_df |>
   group_by(region, month) |>
-  summarise(temp_m = mean(temp, na.rm = TRUE),
+  summarise(temp_m   = mean(temp,   na.rm = TRUE),
             precip_m = mean(precip, na.rm = TRUE), .groups = "drop") |>
-  pivot_longer(c(temp_m, precip_m), names_to = "var") |>
-  mutate(var = recode(var, "temp_m" = "Temperatura (°C)",
-                      "precip_m" = "Precipitação (mm)")) |>
-  ggplot(aes(month, value, color = region, group = region)) +
-  geom_line(linewidth = 1.2) + geom_point(size = 2) +
-  facet_wrap(~var, scales = "free_y") +
-  scale_x_continuous(breaks = 1:12, labels = month.abb) +
-  scale_color_brewer(palette = "Set1") +
-  labs(title = "Perfil Sazonal Médio por Região", x = "Mês", y = NULL, color = "Região") +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "bottom")
+  mutate(mes_abr = month.abb[month])
 
+pal_set1 <- RColorBrewer::brewer.pal(n_distinct(seasonal_long$region), "Set1")
+regions  <- unique(seasonal_long$region)
+
+make_seasonal_trace <- function(reg, y_col, y_label, showlegend) {
+  d <- seasonal_long |> filter(region == reg)
+  list(
+    x           = d$mes_abr,
+    y           = d[[y_col]],
+    type        = "scatter",
+    mode        = "lines+markers",
+    name        = reg,
+    legendgroup = reg,
+    showlegend  = showlegend,
+    hovertemplate = paste0("<b>", reg, "</b><br>Mês: %{x}<br>",
+                           y_label, ": %{y:.1f}<extra></extra>"),
+    line        = list(color = pal_set1[which(regions == reg)], width = 2),
+    marker      = list(color = pal_set1[which(regions == reg)], size = 6)
+  )
+}
+
+traces_temp   <- lapply(regions, make_seasonal_trace, "temp_m",   "Temp (°C)",   TRUE)
+traces_precip <- lapply(regions, make_seasonal_trace, "precip_m", "Precip (mm)", FALSE)
+
+plot_ly() |>
+  (\(p) {
+    for (tr in traces_temp)   p <- add_trace(p, x=tr$x, y=tr$y, type=tr$type,
+      mode=tr$mode, name=tr$name, legendgroup=tr$legendgroup,
+      showlegend=tr$showlegend, hovertemplate=tr$hovertemplate,
+      line=tr$line, marker=tr$marker, xaxis="x", yaxis="y")
+    for (tr in traces_precip) p <- add_trace(p, x=tr$x, y=tr$y, type=tr$type,
+      mode=tr$mode, name=tr$name, legendgroup=tr$legendgroup,
+      showlegend=tr$showlegend, hovertemplate=tr$hovertemplate,
+      line=tr$line, marker=tr$marker, xaxis="x2", yaxis="y2")
+    p
+  })() |>
+  layout(
+    title  = list(text = "Perfil Sazonal Médio por Região", font = list(size = 14)),
+    xaxis  = list(title = "Mês", categoryorder = "array",
+                  categoryarray = month.abb, domain = c(0, 0.47)),
+    yaxis  = list(title = "Temperatura (°C)"),
+    xaxis2 = list(title = "Mês", categoryorder = "array",
+                  categoryarray = month.abb, domain = c(0.53, 1)),
+    yaxis2 = list(title = "Precipitação (mm)"),
+    legend = list(orientation = "h", y = -0.15),
+    margin = list(t = 50)
+  )
 ```
 
 ## PCA Não-Supervisionado — Padrões Climáticos entre Cidades
