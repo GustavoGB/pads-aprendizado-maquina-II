@@ -1,0 +1,1618 @@
+---
+title: "Clima do Brasil — Supervisionado vs Não-Supervisionado"
+subtitle: "PCA · Random Forest · Ensemble · STL · Clustering · Open-Meteo ERA5"
+author: "Aprendizado de Máquina 2 — Insper"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-title: "Sumário"
+    number-sections: true
+    code-fold: true
+    code-summary: "Ver código"
+    fig-width: 10
+    fig-height: 5.5
+    fig-align: center
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r setup}
+library(tidyverse)
+library(jsonlite)
+library(GGally)
+library(factoextra)
+library(FactoMineR)
+library(cluster)
+library(patchwork)
+library(tsibble)
+library(fable)
+library(feasts)
+library(fabletools)
+library(ranger)
+library(doParallel)
+library(plotly)
+library(ggrepel)
+```
+
+```{r setup-ia}
+#| include: false
+# Reproduz o pipeline da Parte I-A para disponibilizar variáveis compartilhadas
+n_cores <- max(1L, parallel::detectCores() - 1L)
+cl      <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+weather_df <- read_csv("data/sp_daily.csv", show_col_types = FALSE) |>
+  mutate(date = as.Date(date))
+
+cutoff    <- as.Date("2023-01-01")
+train_raw <- weather_df |> filter(date <  cutoff)
+test_raw  <- weather_df |> filter(date >= cutoff)
+
+feature_cols <- c("temp_max", "temp_min", "precip", "wind_max", "radiation")
+scale_center <- colMeans(train_raw[feature_cols])
+scale_sd     <- apply(train_raw[feature_cols], 2, sd)
+X_train <- scale(train_raw[feature_cols], center = scale_center, scale = scale_sd)
+X_test  <- scale(test_raw[feature_cols],  center = scale_center, scale = scale_sd)
+
+pca_sup <- prcomp(X_train, center = FALSE, scale. = FALSE)
+
+Z_train <- as.data.frame(predict(pca_sup, X_train))
+Z_test  <- as.data.frame(predict(pca_sup, X_test))
+Z_all <- bind_rows(
+  Z_train |> mutate(date = train_raw$date, temp_mean = train_raw$temp_mean,
+                    temp_max = train_raw$temp_max),
+  Z_test  |> mutate(date = test_raw$date,  temp_mean = test_raw$temp_mean,
+                    temp_max = test_raw$temp_max)
+) |> arrange(date)
+
+n_pcs <- 3
+Z_model <- Z_all |>
+  mutate(
+    across(paste0("PC", seq_len(n_pcs)),
+           list(lag1 = \(x) lag(x, 1), lag7 = \(x) lag(x, 7)),
+           .names = "{.col}_{.fn}"),
+    temp_lag1 = lag(temp_mean, 1),
+    month     = month(date),
+    doy       = yday(date),
+    target    = lead(temp_mean, 1)
+  ) |>
+  drop_na()
+
+feat_names <- setdiff(names(Z_model),
+                      c("date", "temp_mean", "temp_max", "target",
+                        paste0("PC", seq_len(n_pcs))))
+
+train_df <- Z_model |> filter(date <  cutoff)
+test_df  <- Z_model |> filter(date >= cutoff)
+
+rmse <- function(pred, real) sqrt(mean((pred - real)^2))
+mae  <- function(pred, real) mean(abs(pred - real))
+r2   <- function(pred, real) cor(pred, real)^2
+
+lm_fit  <- lm(reformulate(feat_names, "target"), data = train_df)
+pred_lm <- predict(lm_fit, newdata = test_df)
+
+model_cols <- c(feat_names, "target")
+rf_fit  <- ranger(target ~ .,
+                  data        = train_df |> select(all_of(model_cols)),
+                  num.trees   = 500,
+                  importance  = "impurity",
+                  num.threads = n_cores)
+pred_rf  <- predict(rf_fit, data = test_df |> select(all_of(feat_names)))$predictions
+pred_ens <- (pred_lm + pred_rf) / 2
+
+results_ia <- tibble(
+  Modelo = c("LM — PCs + lags", "RF — PCs + lags", "Ensemble (LM + RF)"),
+  RMSE   = c(rmse(pred_lm,  test_df$target),
+             rmse(pred_rf,  test_df$target),
+             rmse(pred_ens, test_df$target)),
+  MAE    = c(mae(pred_lm,   test_df$target),
+             mae(pred_rf,   test_df$target),
+             mae(pred_ens,  test_df$target)),
+  R2     = c(r2(pred_lm,   test_df$target),
+             r2(pred_rf,   test_df$target),
+             r2(pred_ens,  test_df$target))
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 4))) |>
+  arrange(RMSE)
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+---
+
+# Introdução
+
+Este relatório unifica dois modelos para a disciplina Aprendizado de Máquina II aplicados a **dados climáticos reais do Brasil**.
+
+## O Desafio dos Dados Climáticos
+
+Dados climáticos são amplamente utilizados na construção de modelos preditivos e analíticos. Entretanto, existem desafios distintos e extremamente relevantes nesse domínio — em particular, a diferença entre **dados observacionais** (medições de estações meteorológicas, satélites e boias oceânicas) e **dados de previsão** (saídas de modelos numéricos que simulam a atmosfera para o futuro). Além disso, diferentes provedores disponibilizam dados com características, resoluções e coberturas distintas:
+
+| Provedor | Tipo de Dado | Resolução Espacial | Exemplo de Uso |
+|----------|-------------|--------------------|----|
+| **ERA5 (ECMWF)** | Reanálise — combina observações históricas com modelos numéricos para produzir um registro global consistente do clima passado. Cobre de 1940 até ~5 dias atrás. | ~31 km (0.25°) | Reconstrução climática de longo prazo; validação de modelos; estudos de tendência e variabilidade |
+| **ECMWF IFS** | Previsão operacional — modelo numérico de última geração que produz previsões determinísticas e ensemble (51 membros) para até 15 dias, e previsões estendidas sazonais. | ~9 km (HRES) | Previsão meteorológica operacional; planejamento de safras; gestão de risco de energia eólica/solar |
+| **NASA (MERRA-2 / POWER)** | Reanálise e dados de satélite — MERRA-2 é similar ao ERA5 com foco em composição atmosférica (aerossóis, ozônio); o projeto POWER disponibiliza dados solares e meteorológicos para aplicações em energia e agricultura. | ~50 km (0.5°) | Dimensionamento de painéis solares; estimativa de evapotranspiração agrícola; estudos de qualidade do ar |
+| **GFS (NOAA/NCEP)** | Previsão operacional americana — modelo global com rodadas a cada 6h, previsões de até 16 dias. Dados abertos e gratuitos em tempo real. | ~13 km (resolução variável) | Previsão de curto prazo; inicialização de modelos regionais (WRF, Eta); monitoramento de eventos extremos (furacões, frentes frias) |
+
+A distinção entre reanálise e previsão é fundamental: **reanálises** (ERA5, MERRA-2) usam todas as observações disponíveis para reconstruir o estado passado da atmosfera — são os dados mais confiáveis para análise histórica, mas não estão disponíveis em tempo real. **Previsões operacionais** (IFS, GFS) projetam o estado futuro da atmosfera a partir de condições iniciais, com incerteza que cresce a cada hora de horizonte.
+
+## Importância Setorial do Monitoramento Climático
+
+O monitoramento e a modelagem do clima são realizados por diversos institutos governamentais (INMET, INPE/CPTEC no Brasil; NOAA, NASA nos EUA; ECMWF na Europa), empresas privadas e institutos de pesquisa. A relevância desses dados permeia setores estratégicos da economia:
+
+- **Agricultura:** previsões de precipitação e temperatura orientam decisões de plantio, irrigação, aplicação de defensivos e colheita. Safras inteiras dependem de janelas climáticas — uma geada não prevista pode destruir uma safra de café, e a previsão sazonal determina o planejamento da segunda safra de milho. No Brasil, o agronegócio representa cerca de 25% do PIB, tornando a previsão climática um insumo econômico de primeira ordem.
+
+- **Empresas petrolíferas e de energia:** operações offshore (plataformas, FPSOs) dependem de previsões de vento e ondas para planejamento de operações de carga e logística marítima. Parques eólicos e solares precisam de estimativas precisas de recurso energético (radiação, velocidade do vento) para dimensionamento e para comercialização de energia no mercado spot. A reanálise ERA5 é amplamente usada para estimar o potencial eólico/solar em estudos de viabilidade.
+
+- **Mineração:** atividades a céu aberto são diretamente impactadas por chuvas intensas que paralisam operações, comprometem a estabilidade de barragens de rejeitos e inviabilizam transporte em estradas de terra. A previsão de precipitação acumulada é crítica para gestão de risco operacional e ambiental.
+
+- **Portuária e navegação:** a profundidade do calado em portos fluviais (como o de Manaus) depende do regime de chuvas e do nível dos rios — previsões sazonais orientam a logística de grandes cargueiros. Portos marítimos dependem de previsões de maré, vento e ondas para operações de atracação e carga.
+
+## Ensembles em Modelos Climáticos
+
+Uma das técnicas mais poderosas em meteorologia e aprendizado de máquina é o uso de **ensembles** — a combinação de múltiplos modelos ou múltiplas execuções de um mesmo modelo para gerar previsões mais robustas.
+
+Na meteorologia operacional, o conceito de ensemble é empregado de duas formas complementares:
+
+1. **Ensemble de perturbações iniciais (multi-member):** o mesmo modelo numérico (por exemplo, o IFS do ECMWF) é executado múltiplas vezes com pequenas perturbações nas condições iniciais. Como a atmosfera é um sistema caótico, pequenas diferenças nas condições iniciais amplificam-se ao longo do tempo. Os 51 membros do ensemble IFS capturam essa sensibilidade e produzem uma **distribuição de previsões** — o spread entre os membros quantifica a incerteza. Quando os membros convergem, a confiança é alta; quando divergem, o cenário é incerto.
+
+2. **Multi-model ensemble:** previsões de modelos diferentes (GFS, IFS, GEM canadense, ICON alemão) são combinadas — tipicamente por média ponderada, onde os pesos podem ser calibrados historicamente. A literatura mostra consistentemente que a média de múltiplos modelos supera qualquer modelo individual, porque cada um tem vieses sistemáticos diferentes que tendem a se cancelar na combinação.
+
+Neste projeto, aplicamos o princípio de ensemble no contexto de aprendizado de máquina supervisionado: combinamos uma **Regressão Linear** (modelo paramétrico, alto viés, baixa variância) com um **Random Forest** (modelo não-paramétrico, baixo viés, alta variância). A média das previsões dos dois modelos tende a reduzir o erro total, pois os modelos tipicamente erram em dias diferentes e em direções opostas. A redução de erro segue a desigualdade:
+
+$$\text{MSE}_{\text{ensemble}} \leq \frac{1}{K}\sum_{k=1}^K \text{MSE}_k$$
+
+A igualdade só vale quando todos os modelos cometem exatamente os mesmos erros — cenário improvável quando os modelos têm estruturas distintas. Essa é a mesma lógica que torna o multi-model ensemble meteorológico superior a qualquer modelo individual.
+
+## Estrutura do Projeto
+
+O desafio deste projeto é utilizar uma **base de dados unificada** para construir no mínimo dois modelos: um de **aprendizado supervisionado** e outro **não-supervisionado**. Toda a análise utiliza uma **fonte única de dados: Open-Meteo ERA5 Reanalysis**, garantindo consistência metodológica entre as partes.
+
+| | **Parte I — Supervisionado** | **Parte II — Não-Supervisionado** |
+|---|---|---|
+| **Dados** | Open-Meteo ERA5 — São Paulo (diário) | Open-Meteo ERA5 — 12 cidades (diário → mensal) |
+| **Granularidade** | Diária | Mensal (agregação) |
+| **Alvo** | Temperatura de amanhã (`lead`) | Nenhum — descoberto |
+| **Modelos** | LM · RF · Ensemble · Quantile RF | PCA · K-Means · STL · ARIMA · ETS |
+| **Métrica** | RMSE · MAE · R² | Variância explicada · RMSE de forecast |
+
+A pergunta central de cada parte é diferente:
+
+- **Supervisionado:** *"Consigo prever a temperatura de amanhã com base nos padrões de hoje?"*
+- **Não-supervisionado:** *"Existem zonas climáticas naturais no Brasil? Qual estrutura temporal caracteriza cada cidade?"*
+
+Além disso, investigamos duas questões complementares:
+
+- **Aquecimento:** *"São Paulo está esquentando ao longo dos anos?"*
+- **Dinâmica dos clusters:** *"As zonas climáticas estão mudando ao longo do tempo?"*
+
+---
+
+# Parte I-A — PCA: Visualizações e Utilidade para Modelagem
+
+::: {.callout-note}
+## Papel do PCA neste pipeline
+
+O **PCA** comprime 5 features meteorológicas correlacionadas (`temp_max`, `temp_min`,
+`precip`, `wind_max`, `radiation`) em componentes ortogonais.
+Exploramos dois papéis distintos:
+
+1. **Visualização**: PCA revela estrutura latente nos dados climáticos em 2D/3D
+2. **Modelagem**: PCA remove multicolinearidade (ajuda LM), mas RF trata correlações nativamente —
+   veremos se o PCA efetivamente melhora o RMSE preditivo
+:::
+
+## Variância Explicada — Scree Plot
+
+```{r fig-pca-scree}
+#| fig-cap: "Variância explicada por componente. O cotovelo (*elbow*) indica quantos PCs são suficientes para capturar a estrutura dos dados."
+#| fig-height: 4.5
+
+fviz_eig(pca_sup,
+         addlabels = TRUE,
+         ylim      = c(0, 75),
+         barfill   = "#3B82F6",
+         barcolor  = "#1D4ED8",
+         linecolor = "#E8583E",
+         ncp       = 5) +
+  labs(title = "Scree Plot — Componentes Principais das Features Meteorológicas",
+       x = "Componente Principal", y = "% Variância Explicada") +
+  theme_minimal(base_size = 13)
+```
+
+## Contribuição das Variáveis — Círculo de Correlações
+
+```{r fig-pca-loadings}
+#| fig-cap: "Direção e contribuição de cada variável nos dois primeiros componentes. Variáveis próximas têm alta correlação entre si."
+#| fig-height: 5.5
+
+fviz_pca_var(pca_sup,
+             repel         = TRUE,
+             col.var       = "contrib",
+             gradient.cols = c("#91BAD6", "#1D4ED8", "#E8583E"),
+             title         = "Círculo de Correlações — PC1 × PC2") +
+  theme_minimal(base_size = 13)
+```
+
+## Mapa de Calor dos Loadings (PC1–PC3)
+
+```{r fig-pca-heatmap}
+#| fig-cap: "Peso (*loading*) de cada feature original em cada componente principal. Valores positivos/negativos indicam a direção da associação."
+#| fig-height: 4
+
+as.data.frame(pca_sup$rotation[, 1:3]) |>
+  rownames_to_column("Feature") |>
+  pivot_longer(-Feature, names_to = "PC", values_to = "Loading") |>
+  mutate(Feature = factor(Feature, levels = rev(feature_cols))) |>
+  ggplot(aes(PC, Feature, fill = Loading)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(Loading, 2)),
+            color = "white", fontface = "bold", size = 4.5) +
+  scale_fill_gradient2(low = "#E8583E", mid = "white", high = "#1D4ED8",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Loadings por Componente Principal",
+       x = NULL, y = NULL, fill = "Loading") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid = element_blank())
+```
+
+## Scores PC1 × PC2 — Estrutura Temporal
+
+```{r fig-pca-scores}
+#| fig-cap: "Cada ponto é um dia de treino. PC1 separa verão (quente, baixo PC1) de inverno (frio, alto PC1). A cor confirma a associação com temperatura."
+#| fig-height: 5
+
+Z_train |>
+  mutate(
+    temp_mean = train_raw$temp_mean,
+    Estacao   = case_when(
+      month(train_raw$date) %in% c(12, 1, 2) ~ "Verão",
+      month(train_raw$date) %in% c( 3, 4, 5) ~ "Outono",
+      month(train_raw$date) %in% c( 6, 7, 8) ~ "Inverno",
+      TRUE                                    ~ "Primavera"
+    )
+  ) |>
+  ggplot(aes(PC1, PC2, color = temp_mean)) +
+  geom_point(alpha = 0.45, size = 0.8) +
+  scale_color_gradient2(low = "#3B82F6", mid = "#FBBF24", high = "#E8583E",
+                        midpoint = median(train_raw$temp_mean),
+                        name = "Temp\nmédia (°C)") +
+  labs(title    = "Scores PCA: PC1 × PC2 (conjunto de treino)",
+       subtitle = "Cor = temperatura média do dia",
+       x = "PC1", y = "PC2") +
+  theme_minimal(base_size = 13)
+```
+
+## PCA vs. Features Brutas — Impacto no RMSE
+
+```{r pca-vs-raw}
+#| include: false
+
+# Dataset com features escaladas originais (sem PCA)
+raw_all_df <- bind_rows(
+  as.data.frame(X_train) |>
+    mutate(date = train_raw$date, temp_mean = train_raw$temp_mean),
+  as.data.frame(X_test) |>
+    mutate(date = test_raw$date,  temp_mean = test_raw$temp_mean)
+) |>
+  arrange(date) |>
+  mutate(
+    across(all_of(feature_cols),
+           list(lag1 = \(x) lag(x, 1), lag7 = \(x) lag(x, 7)),
+           .names = "{.col}_{.fn}"),
+    temp_lag1 = lag(temp_mean, 1),
+    month     = month(date),
+    doy       = yday(date),
+    target    = lead(temp_mean, 1)
+  ) |>
+  drop_na()
+
+feat_raw   <- setdiff(names(raw_all_df), c("date", "temp_mean", "target"))
+train_nopc <- raw_all_df |> filter(date <  cutoff)
+test_nopc  <- raw_all_df |> filter(date >= cutoff)
+
+lm_raw_fit  <- lm(reformulate(feat_raw, "target"), data = train_nopc)
+pred_lm_raw <- predict(lm_raw_fit, newdata = test_nopc)
+
+rf_raw_fit  <- ranger(target ~ .,
+                      data        = train_nopc |> select(all_of(c(feat_raw, "target"))),
+                      num.trees   = 500,
+                      num.threads = n_cores)
+pred_rf_raw <- predict(rf_raw_fit,
+                       data = test_nopc |> select(all_of(feat_raw)))$predictions
+
+results_pca_raw <- tibble(
+  Modelo    = c("LM — PCs + lags", "LM — Features brutas",
+                "RF — PCs + lags",  "RF — Features brutas"),
+  Algoritmo = c("LM", "LM", "RF", "RF"),
+  Tipo      = c("Com PCA", "Sem PCA", "Com PCA", "Sem PCA"),
+  RMSE      = c(rmse(pred_lm,     test_df$target),
+                rmse(pred_lm_raw, test_nopc$target),
+                rmse(pred_rf,     test_df$target),
+                rmse(pred_rf_raw, test_nopc$target))
+)
+```
+
+```{r fig-pca-vs-raw}
+#| fig-cap: "RMSE no conjunto de teste para LM e RF, com e sem PCA. Diferenças pequenas confirmam que o PCA agrega mais valor à visualização do que ao desempenho preditivo."
+#| fig-height: 4.5
+
+results_pca_raw |>
+  ggplot(aes(Algoritmo, RMSE, fill = Tipo)) +
+  geom_col(position = position_dodge(0.7), width = 0.6) +
+  geom_text(aes(label = round(RMSE, 3)),
+            position = position_dodge(0.7),
+            vjust = -0.4, size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("Com PCA" = "#3B82F6", "Sem PCA" = "#E8583E")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title    = "PCA vs. Features Brutas — RMSE no Teste",
+       subtitle = "Treino: até 2023  |  Teste: 2023 em diante",
+       x = NULL, y = "RMSE (°C)", fill = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+::: {.callout-important}
+## Quando o PCA ajuda — e quando não ajuda
+
+| Situação | PCA ajuda? | Motivo |
+|---|:---:|---|
+| LM com features correlacionadas | **Sim** | Remove multicolinearidade; coeficientes estáveis |
+| RF / XGBoost com features correlacionadas | **Pouco** | Árvores selecionam splits localmente; correlação não distorce |
+| Visualização 2D/3D | **Sempre** | Comprime dimensões para inspeção humana |
+| Interpretabilidade dos coeficientes | **Não** | PCs não têm significado físico direto |
+
+**Para este dataset**: o RF com features brutas obtém RMSE praticamente igual (ou melhor) ao RF com PCA.
+O PCA é mais valioso aqui como **ferramenta exploratória**.
+:::
+
+::: {.callout-tip}
+## Posso adicionar XGBoost ou Redes Neurais?
+
+**Sim** — a estrutura de features já está pronta. As opções mais práticas em R são:
+
+- **XGBoost**: pacote `xgboost` (ou `tidymodels` + `xgboost`). Usa as mesmas features de `train_df`/`test_df`; suporta `nrounds`, `max_depth`, `eta`
+- **MLP simples**: pacote `nnet` (`nnet(target ~ ., data = train_df, size = 32, decay = 1e-4, maxit = 500)`)
+- **Deep Learning**: pacote `brulee` (interface `torch` com `tidymodels`) ou `keras3`
+
+Todos podem ser incorporados na tabela comparativa `results_ib` com a mesma métrica RMSE.
+Diga se deseja implementar algum deles!
+:::
+
+# Parte I-B — Supervisionada Sem Dependência Temporal
+
+::: {.callout-note}
+## Motivação da Parte I-B
+
+A Parte I-A usa `temp_lag1` e lags de PCs — só funciona com dados
+sequenciais ordenados. A **Parte I-B** responde: *conseguimos prever
+a temperatura de amanhã usando apenas as condições de hoje e
+informações sazonais, sem saber o que aconteceu ontem?*
+:::
+
+```{r conceito-ib}
+#| echo: false
+tibble(
+  Aspecto = c("Pergunta","Features temporais","Precisa de histórico?",
+              "Sazonalidade","Interpretação"),
+  `Parte I-A` = c("Ontem prevê amanhã?","temp_lag1, PC_lag7",
+                  "Sim","month/doy discretos","Temporal: momentum"),
+  `Parte I-B` = c("Hoje prevê amanhã?","Nenhuma (ou 1 lag)",
+                  "Não","sin/cos Fourier contínuo","Climática: padrão físico")
+) |>
+  knitr::kable(caption = "Diferenças conceituais I-A vs I-B")
+```
+
+## Sazonalidade Contínua e Cíclica — Termos de Fourier
+
+### O problema das variáveis temporais discretas
+
+A sazonalidade climática é **cíclica**: dezembro e janeiro são termicamente adjacentes,
+mas qualquer representação linear os coloca em extremos opostos do espaço de features.
+
+| Representação | Como trata a sazonalidade | Problema |
+|---|---|---|
+| `month` (1–12) | Numérico ou fator | Dez = 12 e Jan = 1 estão 11 unidades apart |
+| `doy` (1–365) | Numérico contínuo | Dia 365 e dia 1 estão no extremo oposto da escala |
+| One-hot de mês | 11 dummies binárias | Sem suavidade — cada mês é completamente independente |
+| **Fourier sin/cos** | **Contínuo e cíclico** | **Jan e Dez são naturalmente adjacentes** |
+
+### Termos de Fourier: mapeando o tempo em um círculo
+
+A ideia central é projetar o dia do ano no **círculo unitário** usando seno e cosseno:
+
+$$\sin_k = \sin\!\left(\frac{2\pi k \cdot \text{doy}}{N}\right), \quad
+  \cos_k = \cos\!\left(\frac{2\pi k \cdot \text{doy}}{N}\right)$$
+
+onde $N = 365$ (ou 366 em anos bissextos) e $k$ é o número do harmônico.
+
+- **$k=1$ — ciclo anual** (período = 365 dias): captura a oscilação principal verão/inverno
+- **$k=2$ — ciclo semianual** (período = 182 dias): captura assimetrias dentro do ano, como a diferença entre a estação seca de inverno e a chuvosa de verão em São Paulo
+
+::: {.callout-tip}
+## Por que precisamos de sin **e** cos juntos?
+
+Um único $\sin_1$ fixa o pico no dia $\sim$91 (1º de abril). Incluindo $\cos_1$, o
+modelo pode **ajustar a fase livremente**: a combinação $a \cdot \sin_1 + b \cdot \cos_1$
+atinge seu máximo em qualquer dia do ano dependendo da razão $b/a$.
+
+$$a\sin\theta + b\cos\theta = \sqrt{a^2+b^2}\;\sin\!\left(\theta + \arctan\tfrac{b}{a}\right)$$
+
+Para São Paulo, onde o calor máximo ocorre em **janeiro/fevereiro** (hemisfério sul), a
+fase é oposta ao padrão do hemisfério norte — sem $\cos_1$ o modelo não conseguiria
+representar isso corretamente.
+
+Além disso, pelo **Teorema de Fourier**, qualquer função periódica suave pode ser
+aproximada pela soma de harmônicos. Com apenas 4 features ($\sin_1, \cos_1, \sin_2,
+\cos_2$), capturamos os dois padrões dominantes do ciclo climático anual sem overfitting.
+:::
+
+## Engenharia de Features Cross-Sectional
+
+```{r features-ib}
+weather_feat_ib <- weather_df |>
+  mutate(
+    target = lead(temp_mean, 1),
+
+    # Fourier terms — sazonalidade contínua e cíclica
+    doy    = yday(date),
+    n_days = if_else(leap_year(date), 366, 365),
+    sin1   = sin(2 * pi * doy / n_days),   # ciclo anual
+    cos1   = cos(2 * pi * doy / n_days),
+    sin2   = sin(4 * pi * doy / n_days),   # ciclo semianual
+    cos2   = cos(4 * pi * doy / n_days),
+
+    # Estação do ano — sazonalidade categórica
+    season = case_when(
+      month(date) %in% c(12, 1, 2)  ~ "Verao",
+      month(date) %in% c( 3, 4, 5)  ~ "Outono",
+      month(date) %in% c( 6, 7, 8)  ~ "Inverno",
+      month(date) %in% c( 9,10,11)  ~ "Primavera"
+    ),
+    season = factor(season,
+                    levels = c("Verao","Outono","Inverno","Primavera")),
+
+    # Features climáticas do próprio dia (sem lags)
+    temp_range       = temp_max - temp_min,
+    precip_rad_ratio = precip / (radiation + 1),
+
+    # Interações sazonais
+    temp_x_sin1 = temp_mean * sin1,
+    temp_x_cos1 = temp_mean * cos1,
+    rad_x_sin1  = radiation * sin1
+  ) |>
+  drop_na(target)
+
+cat(sprintf("Dataset cross-sectional: %d observações\n", nrow(weather_feat_ib)))
+```
+
+## Visualizando as Features Sazonais
+
+```{r fig-fourier-ib}
+weather_feat_ib |>
+  distinct(doy, sin1, cos1, sin2, cos2) |>
+  slice_head(n = 365) |>
+  pivot_longer(-doy, names_to = "harmônico", values_to = "valor") |>
+  mutate(harmônico = factor(harmônico, levels = c("sin1","cos1","sin2","cos2"))) |>
+  ggplot(aes(doy, valor, color = harmônico)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_brewer(palette = "Set1") +
+  scale_x_continuous(
+    breaks = c(1,60,121,182,244,305,365),
+    labels = c("Jan","Mar","Mai","Jul","Set","Nov","Dez")
+  ) +
+  labs(title    = "Fourier Terms — Sazonalidade Contínua e Cíclica",
+       subtitle = "Substituem month/doy | Jan e Dez ficam naturalmente próximos",
+       x = "Dia do ano", y = "Valor", color = "Harmônico") +
+  theme_minimal(base_size = 13)
+```
+
+```{r fig-season-ib}
+#| fig-height: 4
+p1 <- weather_feat_ib |>
+  ggplot(aes(season, temp_mean, fill = season)) +
+  geom_boxplot(alpha = 0.6, outlier.alpha = 0.3) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Temperatura por Estação", x = NULL, y = "°C") +
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+p2 <- weather_feat_ib |>
+  ggplot(aes(season, precip, fill = season)) +
+  geom_boxplot(alpha = 0.6, outlier.alpha = 0.3) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Precipitação por Estação", x = NULL, y = "mm") +
+  theme_minimal(base_size = 12) + theme(legend.position = "none")
+
+p1 + p2
+```
+
+```{r fig-fourier-vs-scatter}
+#| fig-height: 5
+# Ajuste LM usando apenas os 4 termos de Fourier — mostra o quanto eles capturam do ciclo
+fourier_clim <- lm(temp_mean ~ sin1 + cos1 + sin2 + cos2, data = weather_feat_ib)
+
+weather_feat_ib |>
+  mutate(fourier_fit = predict(fourier_clim)) |>
+  group_by(doy) |>
+  summarise(
+    obs_mean = mean(temp_mean,    na.rm = TRUE),
+    fourier  = mean(fourier_fit,  na.rm = TRUE),
+    obs_q10  = quantile(temp_mean, 0.10, na.rm = TRUE),
+    obs_q90  = quantile(temp_mean, 0.90, na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  ggplot(aes(doy)) +
+  geom_ribbon(aes(ymin = obs_q10, ymax = obs_q90),
+              fill = "#93C5FD", alpha = 0.35) +
+  geom_line(aes(y = obs_mean, color = "Média observada"),
+            linewidth = 1.0) +
+  geom_line(aes(y = fourier,  color = "Ajuste Fourier (4 features)"),
+            linewidth = 1.4, linetype = "dashed") +
+  scale_color_manual(values = c("Média observada"           = "#1D4ED8",
+                                "Ajuste Fourier (4 features)" = "#E8583E")) +
+  scale_x_continuous(breaks = c(1, 60, 121, 182, 244, 305, 365),
+                     labels = c("Jan","Mar","Mai","Jul","Set","Nov","Dez")) +
+  labs(title    = "Temperatura por Dia do Ano vs Curva de Fourier",
+       subtitle = "Faixa azul = P10–P90 interanual | Curva vermelha usa apenas sin1+cos1+sin2+cos2",
+       x = "Dia do ano", y = "Temperatura Média (°C)", color = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+```{r fig-polar-cycle}
+#| fig-height: 5.5
+# Visualização circular — demonstra por que sin/cos é a representação natural
+weather_feat_ib |>
+  group_by(doy) |>
+  summarise(temp_med = mean(temp_mean, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(doy, temp_med)) +
+  geom_line(color = "#E8583E", linewidth = 1.4) +
+  geom_area(fill = "#E8583E", alpha = 0.15) +
+  coord_polar() +
+  scale_x_continuous(
+    breaks = c(1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335),
+    labels = month.abb,
+    limits = c(1, 365)
+  ) +
+  labs(title    = "Ciclo Anual de Temperatura — Visualização Circular",
+       subtitle = "Os termos sin/cos mapeiam este círculo: Jan e Dez são adjacentes por construção",
+       x = NULL, y = "°C") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(size = 10, face = "bold"))
+```
+
+```{r fig-heatmap-month-year}
+# Heatmap mês × ano: mostra sazonalidade E tendência de longo prazo simultaneamente
+weather_df |>
+  mutate(year = year(date), month = month(date)) |>
+  group_by(year, month) |>
+  summarise(temp = mean(temp_mean, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(year, factor(month, labels = month.abb), fill = temp)) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  scale_fill_gradient2(
+    low      = "#3B82F6",
+    mid      = "#FEF9C3",
+    high     = "#E8583E",
+    midpoint = median(weather_df$temp_mean, na.rm = TRUE)
+  ) +
+  labs(title    = "Temperatura Média Mensal — São Paulo (1980–2024)",
+       subtitle = "Eixo vertical = sazonalidade | Eixo horizontal = tendência de aquecimento",
+       x = "Ano", y = NULL, fill = "°C") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9))
+```
+
+```{r fig-anomaly-annual}
+# Anomalia anual em relação à climatologia do treino (sem leakage)
+clim_doy <- weather_df |>
+  filter(date < cutoff) |>
+  mutate(doy = yday(date)) |>
+  group_by(doy) |>
+  summarise(clim_temp = mean(temp_mean, na.rm = TRUE), .groups = "drop")
+
+weather_df |>
+  mutate(doy = yday(date), year = year(date)) |>
+  left_join(clim_doy, by = "doy") |>
+  mutate(anomaly = temp_mean - clim_temp) |>
+  group_by(year) |>
+  summarise(anomaly_mean = mean(anomaly, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(year, anomaly_mean, fill = anomaly_mean > 0)) +
+  geom_col(alpha = 0.85) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#1D4ED8", fill = "#93C5FD", alpha = 0.25,
+              linewidth = 1.0, linetype = "solid",
+              data = ~filter(., year <= year(cutoff))) +
+  scale_fill_manual(values = c("TRUE" = "#E8583E", "FALSE" = "#3B82F6"),
+                    guide = "none") +
+  labs(title    = "Anomalia de Temperatura Anual — São Paulo (1980–2024)",
+       subtitle = "Desvio em relação à média climatológica 1980–2022 | Linha = tendência linear",
+       x = "Ano", y = "Anomalia (°C)") +
+  theme_minimal(base_size = 13)
+```
+
+```{r fig-feature-corr-ib}
+#| fig-height: 5
+# Matriz de correlação entre as features de I-B e o alvo
+ord <- c("target","temp_max","temp_min","temp_range",
+         "precip","wind_max","radiation","sin1","cos1","sin2","cos2")
+
+weather_feat_ib |>
+  select(all_of(ord)) |>
+  drop_na() |>
+  cor() |>
+  as.data.frame() |>
+  rownames_to_column("var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "corr") |>
+  mutate(var1 = factor(var1, levels = ord),
+         var2 = factor(var2, levels = rev(ord))) |>
+  ggplot(aes(var1, var2, fill = corr)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", corr),
+                color = abs(corr) > 0.45), size = 3) +
+  scale_fill_gradient2(low = "#3B82F6", mid = "white", high = "#E8583E",
+                       midpoint = 0, limits = c(-1, 1)) +
+  scale_color_manual(values = c("FALSE" = "gray30", "TRUE" = "white"),
+                     guide = "none") +
+  labs(title    = "Correlação entre Features e Alvo — Parte I-B",
+       subtitle = "Linha 'target': correlação de cada feature com a temperatura de amanhã",
+       x = NULL, y = NULL, fill = "r") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Split, Escala e Features
+
+```{r split-scale-ib}
+train_ib <- weather_feat_ib |> filter(date <  cutoff)
+test_ib  <- weather_feat_ib |> filter(date >= cutoff)
+
+scale_cols_ib <- c(
+  "temp_max","temp_min","temp_range","precip",
+  "wind_max","radiation","precip_rad_ratio",
+  "sin1","cos1","sin2","cos2",
+  "temp_x_sin1","temp_x_cos1","rad_x_sin1"
+)
+
+center_ib <- colMeans(train_ib[scale_cols_ib], na.rm = TRUE)
+sd_ib     <- apply(train_ib[scale_cols_ib], 2, sd, na.rm = TRUE)
+
+scale_ib <- function(df) {
+  df[scale_cols_ib] <- scale(df[scale_cols_ib],
+                              center = center_ib, scale = sd_ib)
+  df
+}
+
+train_ib_s <- scale_ib(train_ib)
+test_ib_s  <- scale_ib(test_ib)
+
+feat_ib_base <- c("temp_max","temp_min","temp_range","precip",
+                  "wind_max","radiation","precip_rad_ratio",
+                  "sin1","cos1","sin2","cos2")
+
+feat_ib_full <- c(feat_ib_base, "season",
+                  "temp_x_sin1","temp_x_cos1","rad_x_sin1")
+
+cat(sprintf("Treino: %d | Teste: %d\n", nrow(train_ib), nrow(test_ib)))
+cat(sprintf("feat_base: %d | feat_full: %d\n",
+            length(feat_ib_base), length(feat_ib_full)))
+```
+
+## Modelos Parte I-B
+
+```{r modelos-ib}
+n_cores_ib <- max(1L, parallel::detectCores() - 1L)
+
+# LM Base
+lm_ib_base      <- lm(reformulate(feat_ib_base,"target"), data = train_ib_s)
+pred_lm_ib_base <- predict(lm_ib_base, newdata = test_ib_s)
+
+# LM Full
+lm_ib_full      <- lm(reformulate(feat_ib_full,"target"), data = train_ib_s)
+pred_lm_ib_full <- predict(lm_ib_full, newdata = test_ib_s)
+
+# RF Base
+rf_ib_base      <- ranger(reformulate(feat_ib_base,"target"),
+                           data = train_ib_s, num.trees = 500,
+                           importance = "impurity", num.threads = n_cores_ib)
+pred_rf_ib_base <- predict(rf_ib_base, data = test_ib_s)$predictions
+
+# RF Full
+rf_ib_full      <- ranger(reformulate(feat_ib_full,"target"),
+                           data = train_ib_s, num.trees = 500,
+                           importance = "impurity", num.threads = n_cores_ib)
+pred_rf_ib_full <- predict(rf_ib_full, data = test_ib_s)$predictions
+
+# Ensemble
+pred_ens_ib <- (pred_lm_ib_full + pred_rf_ib_full) / 2
+
+for (nm in c("LM Base","LM Full","RF Base","RF Full","Ensemble")) {
+  pred <- switch(nm,
+    "LM Base"  = pred_lm_ib_base,
+    "LM Full"  = pred_lm_ib_full,
+    "RF Base"  = pred_rf_ib_base,
+    "RF Full"  = pred_rf_ib_full,
+    "Ensemble" = pred_ens_ib
+  )
+  cat(sprintf("%-10s RMSE: %.3f °C | MAE: %.3f °C | R²: %.4f\n",
+              nm, rmse(pred, test_ib$target),
+              mae(pred, test_ib$target),
+              r2(pred, test_ib$target)))
+}
+```
+
+## Diagnóstico: ACF dos Resíduos
+
+::: {.callout-note}
+## O que é a ACF dos Resíduos e por que importa?
+
+**Resíduo** é a diferença entre o valor real e o previsto: $e_t = y_t - \hat{y}_t$.
+Em um modelo perfeito, os resíduos seriam ruído branco — sem nenhuma estrutura
+explorável. A **função de autocorrelação (ACF)** mede a correlação de $e_t$ com
+$e_{t-k}$ (o erro de $k$ dias atrás).
+
+| ACF no lag-$k$ | Interpretação |
+|---|---|
+| Significativa no lag-1 | O erro de ontem prevê o erro de hoje — há **momentum residual** não capturado |
+| Significativa em múltiplos lags | Padrão sazonal ou tendência residual — o modelo perdeu estrutura de longo prazo |
+| Todas dentro do IC | Resíduos são ruído branco — o modelo extraiu toda a estrutura previsível |
+
+A banda pontilhada representa o intervalo de confiança de 95% sob a hipótese nula de
+ruído branco: $\pm 1.96 / \sqrt{n}$. Barras que ultrapassam essa banda indicam
+autocorrelação estatisticamente significativa.
+
+O **teste de Ljung-Box** formaliza isso: $H_0$ = os primeiros $h$ autocorrelações são
+conjuntamente nulas. Um p-valor < 0.05 rejeita $H_0$, confirmando estrutura residual.
+:::
+
+```{r fig-acf-ib}
+residuos_ib <- test_ib$target - pred_rf_ib_full
+acf_res_ib  <- acf(residuos_ib, lag.max = 30, plot = FALSE)
+
+ci_ib <- qnorm(0.975) / sqrt(length(residuos_ib))
+
+acf_df_ib <- tibble(
+  lag = as.numeric(acf_res_ib$lag[-1]),
+  acf = as.numeric(acf_res_ib$acf[-1]),
+  ci  = ci_ib
+)
+
+acf_df_ib |>
+  ggplot(aes(lag, acf)) +
+  geom_col(aes(fill = abs(acf) > ci), alpha = 0.8) +
+  geom_hline(yintercept =  ci_ib, linetype = "dashed", color = "#E8583E", linewidth = 0.8) +
+  geom_hline(yintercept = -ci_ib, linetype = "dashed", color = "#E8583E", linewidth = 0.8) +
+  scale_fill_manual(values = c("FALSE" = "#93C5FD", "TRUE" = "#E8583E"),
+                    labels = c("Dentro do IC 95%", "Significativo (fora do IC)")) +
+  labs(title    = "ACF dos Resíduos — RF Full (Parte I-B, sem lags)",
+       subtitle = "Banda vermelha = IC 95% | Barras vermelhas = autocorrelação residual detectada",
+       x = "Lag (dias)", y = "Autocorrelação", fill = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+# Lags 1–5 individuais
+cat("ACF dos resíduos — lags 1 a 5:\n")
+for (i in 1:5) {
+  cat(sprintf("  lag-%d: %.3f  %s\n", i, acf_df_ib$acf[i],
+              ifelse(abs(acf_df_ib$acf[i]) > ci_ib, "⚠ significativo", "OK")))
+}
+
+# Teste formal de Ljung-Box (H0: sem autocorrelação nos primeiros 10 lags)
+lb <- Box.test(residuos_ib, lag = 10, type = "Ljung-Box")
+cat(sprintf("\nLjung-Box (h=10): Q = %.2f | p = %.4f  →  %s\n",
+            lb$statistic, lb$p.value,
+            ifelse(lb$p.value < 0.05,
+                   "rejeita H0 — autocorrelacao significativa nos residuos",
+                   "nao rejeita H0 — residuos sao ruido branco")))
+```
+
+::: {.callout-warning}
+## Interpretando o resultado
+
+Se o lag-1 for significativo, o modelo está cometendo **erros sistemáticos com
+persistência**: dias em que subestimou tendem a ser seguidos por mais dias de
+subestimação, e vice-versa. Isso é evidência de que a série ainda carrega
+autocorrelação não explicada pelas features climáticas.
+
+Duas estratégias para corrigir:
+
+1. **Adicionar `temp_lag1`** como feature (modelo meio-termo, Seção seguinte) —
+   simples e eficaz, mas reintroduz dependência temporal.
+2. **Diferenciar o alvo** — modelar a *mudança* de temperatura ao invés do
+   nível, removendo a dependência de forma estrutural (Seção a seguir).
+:::
+
+## Diferenciação, ARIMA e Comparação entre Famílias
+
+A **diferenciação de primeira ordem** transforma a série de níveis em variações:
+
+$$\Delta y_t = y_t - y_{t-1}$$
+
+Em vez de prever $y_{t+1}$ diretamente, o modelo aprende **quanto a temperatura vai
+mudar**. A reconstrução é imediata: $\hat{y}_{t+1} = y_t + \hat{\Delta}_{t+1}$
+
+::: {.callout-note}
+## Por que a diferenciação reduz a dependência cronológica?
+
+A série original tem autocorrelação lag-1 ≈ 0.8 — saber o nível de hoje já explica
+~80 % do nível de amanhã, e o modelo cross-sectional deixa esse sinal nos resíduos.
+
+Após diferenciação, $\Delta y_t$ é **estacionária**: média próxima de zero, variância
+constante, autocorrelação muito menor. Features de Fourier e estação agora capturam
+*quanto* a temperatura tende a mudar, não onde ela está. O erro do dia $t$ deixa de
+arrastar o erro do dia $t+1$.
+:::
+
+::: {.callout-warning}
+## Taxonomia dos modelos por relação com o tempo
+
+| Família | Modelos | Informação temporal usada |
+|---|---|---|
+| **F1 — Cross-Sectional** | LM/RF Base/Full, Ensemble | Nenhuma — só features climáticas e Fourier |
+| **F2 — Diferenciação** | LM Diff, RF Diff | $y_t$ (valor de **hoje**, conhecido na previsão) |
+| **F3 — Série Temporal** | ARIMA | Histórico completo via AR/MA; diferenciação interna |
+| **F4 — Lag Explícito** | RF + lag-1 | $y_{t-1}$ (valor de **ontem**) como feature direta |
+
+As Famílias 2 e 3 tratam a dependência temporal de forma **estrutural** — por isso
+não é válido combiná-las com features de lag-1 (Família 4): seriam abordagens
+híbridas que misturam os dois mecanismos sem justificativa clara.
+:::
+
+### Família 2 — LM e RF sobre o alvo diferenciado
+
+```{r diff-models}
+weather_feat_diff <- weather_feat_ib |>
+  mutate(diff_target = lead(temp_mean, 1) - temp_mean) |>
+  drop_na(diff_target)
+
+train_diff <- weather_feat_diff |> filter(date <  cutoff)
+test_diff  <- weather_feat_diff |> filter(date >= cutoff)
+
+scale_diff_fn <- function(df) {
+  df[scale_cols_ib] <- scale(df[scale_cols_ib],
+                              center = center_ib, scale = sd_ib)
+  df
+}
+
+# LM Diferenciado
+lm_diff            <- lm(reformulate(feat_ib_full, "diff_target"),
+                          data = scale_diff_fn(train_diff))
+pred_lm_diff_raw   <- predict(lm_diff, newdata = scale_diff_fn(test_diff))
+pred_lm_diff_level <- test_diff$temp_mean + pred_lm_diff_raw
+
+# RF Diferenciado
+rf_diff         <- ranger(reformulate(feat_ib_full, "diff_target"),
+                           data        = scale_diff_fn(train_diff),
+                           num.trees   = 500, importance = "impurity",
+                           num.threads = n_cores_ib)
+pred_diff_raw   <- predict(rf_diff, data = scale_diff_fn(test_diff))$predictions
+pred_diff_level <- test_diff$temp_mean + pred_diff_raw
+
+cat("Família 2 — Diferenciação (nível reconstruído):\n")
+cat(sprintf("  LM Diff: RMSE = %.3f | MAE = %.3f | R² = %.4f\n",
+            rmse(pred_lm_diff_level, test_diff$target),
+            mae( pred_lm_diff_level, test_diff$target),
+            r2(  pred_lm_diff_level, test_diff$target)))
+cat(sprintf("  RF Diff: RMSE = %.3f | MAE = %.3f | R² = %.4f\n",
+            rmse(pred_diff_level, test_diff$target),
+            mae( pred_diff_level, test_diff$target),
+            r2(  pred_diff_level, test_diff$target)))
+```
+
+### Família 3 — ARIMA (univariado, sem features externas)
+
+O ARIMA(p,**d**,q) incorpora diferenciação nativamente através do parâmetro $d$:
+com $d=1$, o modelo equivale a ajustar um ARMA na série diferenciada $\Delta y_t$.
+Ao contrário das Famílias 1 e 2, o ARIMA usa **apenas a história passada da série**
+— sem nenhuma feature climática ou sazonal externa.
+
+```{r arima-daily}
+#| cache: true
+# tsibble diário com o alvo de treino
+train_arima_ts <- train_df |>
+  select(date, temp = target) |>
+  as_tsibble(index = date)
+
+# PDQ(0,0,0) desativa o ARIMA sazonal (período anual seria 365 — muito lento)
+# O componente sazonal de longo prazo será capturado parcialmente pelo AR
+arima_fit <- train_arima_ts |>
+  model(ARIMA = ARIMA(temp ~ PDQ(0, 0, 0)))
+
+cat("Ordem ARIMA selecionada automaticamente:\n")
+print(report(arima_fit))
+
+# Previsão multi-step para todo o período de teste
+fc_arima   <- arima_fit |> forecast(h = nrow(test_df))
+pred_arima <- as_tibble(fc_arima) |> arrange(date) |> pull(.mean)
+
+cat(sprintf("\nARIMA: RMSE = %.3f | MAE = %.3f | R² = %.4f\n",
+            rmse(pred_arima, test_df$target),
+            mae( pred_arima, test_df$target),
+            r2(  pred_arima, test_df$target)))
+```
+
+### Família 4 — RF com lag-1 explícito (meio-termo)
+
+```{r rf-ib-lag1}
+weather_feat_ib2 <- weather_feat_ib |>
+  mutate(temp_lag1 = lag(temp_mean, 1)) |>
+  drop_na()
+
+feat_ib_lag1   <- c(feat_ib_full, "temp_lag1")
+train_ib2      <- weather_feat_ib2 |> filter(date <  cutoff)
+test_ib2       <- weather_feat_ib2 |> filter(date >= cutoff)
+
+scale_cols_ib2 <- c(scale_cols_ib, "temp_lag1")
+center_ib2     <- colMeans(train_ib2[scale_cols_ib2], na.rm = TRUE)
+sd_ib2         <- apply(train_ib2[scale_cols_ib2], 2, sd, na.rm = TRUE)
+
+scale_ib2 <- function(df) {
+  df[scale_cols_ib2] <- scale(df[scale_cols_ib2],
+                               center = center_ib2, scale = sd_ib2)
+  df
+}
+
+rf_ib_lag1      <- ranger(reformulate(feat_ib_lag1, "target"),
+                           data        = scale_ib2(train_ib2), num.trees = 500,
+                           importance  = "impurity", num.threads = n_cores_ib)
+pred_rf_ib_lag1 <- predict(rf_ib_lag1, data = scale_ib2(test_ib2))$predictions
+
+cat(sprintf("Família 4 — RF + lag-1: RMSE = %.3f | MAE = %.3f | R² = %.4f\n",
+            rmse(pred_rf_ib_lag1, test_ib2$target),
+            mae( pred_rf_ib_lag1, test_ib2$target),
+            r2(  pred_rf_ib_lag1, test_ib2$target)))
+```
+
+### Gráficos Comparativos entre Famílias
+
+```{r fig-acf-4panel}
+#| fig-height: 6
+# ACF dos resíduos — representante de cada família (todos sobre o período de teste)
+acf_to_tbl <- function(residuos, label) {
+  a <- acf(residuos, lag.max = 30, plot = FALSE)
+  tibble(lag = as.numeric(a$lag[-1]), acf = as.numeric(a$acf[-1]), modelo = label)
+}
+
+ci_acf <- qnorm(0.975) / sqrt(length(residuos_ib))
+
+bind_rows(
+  acf_to_tbl(test_ib$target  - pred_rf_ib_full,    "F1: RF Full (cross-sec.)"),
+  acf_to_tbl(test_diff$target - pred_diff_level,    "F2: RF Diferenciado"),
+  acf_to_tbl(test_df$target   - pred_arima,         "F3: ARIMA"),
+  acf_to_tbl(test_ib2$target  - pred_rf_ib_lag1,    "F4: RF + lag-1")
+) |>
+  mutate(modelo = factor(modelo, levels = c(
+    "F1: RF Full (cross-sec.)", "F2: RF Diferenciado",
+    "F3: ARIMA",                "F4: RF + lag-1"
+  ))) |>
+  ggplot(aes(lag, acf)) +
+  geom_col(aes(fill = abs(acf) > ci_acf), alpha = 0.8) +
+  geom_hline(yintercept =  ci_acf, linetype = "dashed",
+             color = "#E8583E", linewidth = 0.6) +
+  geom_hline(yintercept = -ci_acf, linetype = "dashed",
+             color = "#E8583E", linewidth = 0.6) +
+  scale_fill_manual(values = c("FALSE" = "#93C5FD", "TRUE" = "#E8583E"),
+                    guide = "none") +
+  facet_wrap(~modelo, ncol = 2) +
+  labs(title    = "ACF dos Resíduos por Família de Modelo",
+       subtitle = "Lag-1 vermelho = estrutura temporal ainda nos resíduos | F1 deve ter o maior pico",
+       x = "Lag (dias)", y = "Autocorrelação") +
+  theme_minimal(base_size = 12)
+```
+
+```{r fig-rmse-familias}
+# RMSE agrupado por família — visão completa de todas as abordagens
+rmse_all <- tibble(
+  Família = c(
+    rep("F1: Cross-Sectional", 5),
+    rep("F2: Diferenciação",   2),
+    "F3: Série Temporal",
+    "F4: Lag Explícito"
+  ),
+  Modelo = c(
+    "LM Base","LM Full","RF Base","RF Full","Ensemble",
+    "LM Diff","RF Diff",
+    "ARIMA",
+    "RF + lag-1"
+  ),
+  RMSE = c(
+    rmse(pred_lm_ib_base,    test_ib$target),
+    rmse(pred_lm_ib_full,    test_ib$target),
+    rmse(pred_rf_ib_base,    test_ib$target),
+    rmse(pred_rf_ib_full,    test_ib$target),
+    rmse(pred_ens_ib,        test_ib$target),
+    rmse(pred_lm_diff_level, test_diff$target),
+    rmse(pred_diff_level,    test_diff$target),
+    rmse(pred_arima,         test_df$target),
+    rmse(pred_rf_ib_lag1,    test_ib2$target)
+  )
+)
+
+rmse_all |>
+  mutate(Modelo = reorder(Modelo, RMSE)) |>
+  ggplot(aes(Modelo, RMSE, fill = Família)) +
+  geom_col(width = 0.7, alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.3f", RMSE)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "F1: Cross-Sectional" = "#93C5FD",
+    "F2: Diferenciação"   = "#2ECC71",
+    "F3: Série Temporal"  = "#F59E0B",
+    "F4: Lag Explícito"   = "#E8583E"
+  )) +
+  ylim(0, max(rmse_all$RMSE) * 1.2) +
+  labs(title    = "RMSE por Modelo e Família — Visão Consolidada",
+       subtitle = "Cor = família | Menor RMSE = melhor desempenho preditivo",
+       x = NULL, y = "RMSE (°C)", fill = "Família") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+```{r fig-forecast-overlay}
+#| fig-height: 5
+# Overlay temporal: 1 modelo por família nos primeiros 90 dias de teste
+n_plot <- 90
+
+tibble(
+  date          = test_ib$date[seq_len(n_plot)],
+  Real          = test_ib$target[seq_len(n_plot)],
+  `F1: RF Full` = pred_rf_ib_full[seq_len(n_plot)],
+  `F2: RF Diff` = pred_diff_level[seq_len(n_plot)],
+  `F3: ARIMA`   = pred_arima[seq_len(n_plot)]
+) |>
+  left_join(
+    tibble(date = test_ib2$date, `F4: RF+lag1` = pred_rf_ib_lag1),
+    by = "date"
+  ) |>
+  pivot_longer(-date, names_to = "Modelo", values_to = "Temp") |>
+  mutate(Modelo = factor(Modelo, levels = c("Real","F1: RF Full",
+                                             "F2: RF Diff","F3: ARIMA","F4: RF+lag1"))) |>
+  ggplot(aes(date, Temp, color = Modelo,
+             linewidth = Modelo == "Real", alpha = Modelo == "Real")) +
+  geom_line() +
+  scale_color_manual(values = c(
+    "Real"         = "#1F2937",
+    "F1: RF Full"  = "#93C5FD",
+    "F2: RF Diff"  = "#2ECC71",
+    "F3: ARIMA"    = "#F59E0B",
+    "F4: RF+lag1"  = "#E8583E"
+  )) +
+  scale_linewidth_manual(values = c("TRUE" = 1.3, "FALSE" = 0.7), guide = "none") +
+  scale_alpha_manual(values = c("TRUE" = 1.0, "FALSE" = 0.85), guide = "none") +
+  labs(title    = "Previsão vs Real — Primeiros 90 Dias de Teste (Jan–Mar 2023)",
+       subtitle = "Um modelo representativo por família",
+       x = NULL, y = "Temperatura Média (°C)", color = "Modelo") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+```{r fig-scatter-familias}
+#| fig-height: 5
+# Scatter predito vs real — 4 painéis, um por família
+bind_rows(
+  tibble(Real = test_ib$target,   Pred = pred_rf_ib_full,    Família = "F1: RF Full"),
+  tibble(Real = test_diff$target, Pred = pred_diff_level,    Família = "F2: RF Diff"),
+  tibble(Real = test_df$target,   Pred = pred_arima,         Família = "F3: ARIMA"),
+  tibble(Real = test_ib2$target,  Pred = pred_rf_ib_lag1,    Família = "F4: RF + lag-1")
+) |>
+  ggplot(aes(Real, Pred)) +
+  geom_point(alpha = 0.15, size = 0.7, color = "#3B82F6") +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "#E8583E", linewidth = 0.9) +
+  facet_wrap(~Família, ncol = 2) +
+  labs(title    = "Predito vs Real por Família de Modelo",
+       subtitle = "Diagonal vermelha = predição perfeita | Dispersão acima/abaixo = viés",
+       x = "Real (°C)", y = "Previsto (°C)") +
+  theme_minimal(base_size = 12)
+```
+
+::: {.callout-important}
+## Qual família escolher?
+
+| Família | Melhor cenário | Limitação principal |
+|---|---|---|
+| **F1 Cross-Sectional** | Observação isolada sem histórico | Perde autocorrelação residual |
+| **F2 Diferenciação** | Conhece $y_t$ (hoje), quer $y_{t+1}$ | RMSE ligeiramente maior que F4 |
+| **F3 ARIMA** | Série densa, horizonte multi-step | Sem features climáticas externas |
+| **F4 Lag Explícito** | Máxima acurácia 1 passo à frente | Requer $y_{t-1}$ disponível |
+
+**ARIMA vs RF Diff:** ambos trabalham internamente com a série diferenciada. ARIMA usa
+relações AR/MA lineares; RF Diff usa Fourier + features climáticas não-lineares. O RF
+Diff tende a ser superior quando a sazonalidade e as condições do dia carregam informação
+além do padrão AR — mas ARIMA é mais parcimonioso e robusto em séries curtas.
+:::
+
+## Resultados Parte I-B
+
+```{r results-ib}
+results_ib <- tibble(
+  Família = c(
+    rep("F1: Cross-Sectional", 5),
+    rep("F2: Diferenciação",   2),
+    "F3: Série Temporal",
+    "F4: Lag Explícito"
+  ),
+  Modelo = c(
+    "LM Base","LM Full","RF Base","RF Full","Ensemble",
+    "LM Diff","RF Diff",
+    "ARIMA",
+    "RF + temp_lag1"
+  ),
+  RMSE = c(
+    rmse(pred_lm_ib_base,    test_ib$target),
+    rmse(pred_lm_ib_full,    test_ib$target),
+    rmse(pred_rf_ib_base,    test_ib$target),
+    rmse(pred_rf_ib_full,    test_ib$target),
+    rmse(pred_ens_ib,        test_ib$target),
+    rmse(pred_lm_diff_level, test_diff$target),
+    rmse(pred_diff_level,    test_diff$target),
+    rmse(pred_arima,         test_df$target),
+    rmse(pred_rf_ib_lag1,    test_ib2$target)
+  ),
+  MAE = c(
+    mae(pred_lm_ib_base,    test_ib$target),
+    mae(pred_lm_ib_full,    test_ib$target),
+    mae(pred_rf_ib_base,    test_ib$target),
+    mae(pred_rf_ib_full,    test_ib$target),
+    mae(pred_ens_ib,        test_ib$target),
+    mae(pred_lm_diff_level, test_diff$target),
+    mae(pred_diff_level,    test_diff$target),
+    mae(pred_arima,         test_df$target),
+    mae(pred_rf_ib_lag1,    test_ib2$target)
+  ),
+  R2 = c(
+    r2(pred_lm_ib_base,    test_ib$target),
+    r2(pred_lm_ib_full,    test_ib$target),
+    r2(pred_rf_ib_base,    test_ib$target),
+    r2(pred_rf_ib_full,    test_ib$target),
+    r2(pred_ens_ib,        test_ib$target),
+    r2(pred_lm_diff_level, test_diff$target),
+    r2(pred_diff_level,    test_diff$target),
+    r2(pred_arima,         test_df$target),
+    r2(pred_rf_ib_lag1,    test_ib2$target)
+  )
+) |>
+  mutate(across(where(is.numeric), \(x) round(x, 4))) |>
+  arrange(RMSE)
+
+results_ib |>
+  knitr::kable(caption = "Parte I-B: todos os modelos por família (ordenados por RMSE)")
+```
+
+## Comparação Global I-A vs I-B
+
+```{r comparacao-global}
+comparacao <- bind_rows(
+  results_ia |> slice_min(RMSE,n=1) |>
+    mutate(Abordagem = "I-A: PCA + Lags Temporais"),
+  results_ib |> filter(!str_detect(Modelo,"lag1")) |>
+    slice_min(RMSE,n=1) |>
+    mutate(Abordagem = "I-B: Cross-Sectional (sem lags)"),
+  results_ib |> filter(str_detect(Modelo,"lag1")) |>
+    slice_min(RMSE,n=1) |>
+    mutate(Abordagem = "I-B: Meio-Termo (+ temp_lag1)")
+)
+
+comparacao |>
+  select(Abordagem, Modelo, RMSE, MAE, R2) |>
+  knitr::kable(caption = "Melhores modelos de cada abordagem")
+
+comparacao |>
+  ggplot(aes(reorder(Abordagem, RMSE), RMSE, fill = Abordagem)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = sprintf("%.3f °C", RMSE)),
+            hjust = -0.1, size = 4.5, fontface = "bold") +
+  coord_flip() +
+  scale_fill_manual(values = c("#3B82F6","#2ECC71","#F59E0B")) +
+  ylim(0, max(comparacao$RMSE) * 1.25) +
+  labs(title    = "RMSE: I-A vs I-B vs Meio-Termo",
+       subtitle = "A diferença = custo de remover dependência temporal",
+       x = NULL, y = "RMSE (°C)") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+```{r fig-ib-importance}
+#| fig-height: 4
+rf_ib_full$variable.importance |>
+  enframe("Feature","Importance") |>
+  mutate(Importance = Importance / max(Importance)) |>
+  arrange(desc(Importance)) |>
+  ggplot(aes(reorder(Feature, Importance), Importance, fill = Importance)) +
+  geom_col() + coord_flip() +
+  scale_fill_gradient(low = "#93C5FD", high = "#1D4ED8") +
+  labs(title    = "Importância das Features — RF Full (Parte I-B)",
+       subtitle = "Sem lags | Fourier + season + clima do dia",
+       x = NULL, y = "Importância relativa") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+# Conclusão — Análise Supervisionada
+
+## I-A vs I-B — Comparativo Final
+
+```{r conclusao-comparativo}
+#| echo: false
+best_ia       <- results_ia |> slice_min(RMSE, n = 1)
+best_ib_nolag <- results_ib |> filter(!str_detect(Modelo, "lag1")) |> slice_min(RMSE, n = 1)
+
+comparativo <- bind_rows(
+  results_ia |> slice_min(RMSE, n = 1) |>
+    mutate(Abordagem = "I-A: PCA + Lags"),
+  results_ib |> filter(!str_detect(Modelo, "lag1")) |> slice_min(RMSE, n = 1) |>
+    mutate(Abordagem = "I-B: Cross-Sectional (sem lags)"),
+  results_ib |> filter(str_detect(Modelo, "lag1")) |> slice_min(RMSE, n = 1) |>
+    mutate(Abordagem = "I-B: Meio-Termo (+ temp_lag1)")
+)
+
+comparativo |>
+  select(Abordagem, Modelo, RMSE, MAE, R2) |>
+  knitr::kable(caption = "Melhores modelos por abordagem supervisionada")
+```
+
+```{r fig-conclusao-comparativo}
+#| echo: false
+#| fig-cap: "RMSE do melhor modelo em cada abordagem supervisionada. Barras mais à esquerda = menor erro."
+#| fig-height: 4
+comparativo |>
+  ggplot(aes(reorder(Abordagem, RMSE), RMSE, fill = Abordagem)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = sprintf("%.3f °C", RMSE)),
+            hjust = -0.1, size = 4.5, fontface = "bold") +
+  coord_flip() +
+  scale_fill_manual(values = c("#3B82F6", "#2ECC71", "#F59E0B")) +
+  ylim(0, max(comparativo$RMSE) * 1.3) +
+  labs(title    = "RMSE: Melhor Modelo de Cada Abordagem Supervisionada",
+       subtitle = "Quanto mais à esquerda, melhor o desempenho preditivo",
+       x = NULL, y = "RMSE (°C)") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+::: {.callout-important}
+## Melhor Modelo — Parte I-A (com lags temporais)
+
+**`r best_ia$Modelo`** — RMSE = `r best_ia$RMSE` °C · MAE = `r best_ia$MAE` °C · R² = `r best_ia$R2`
+
+A Parte I-A tem o menor RMSE porque explora a alta autocorrelação serial da temperatura:
+`temp_lag1` sozinho explica cerca de 80 % da variância do alvo. O PCA condensou 5
+variáveis correlacionadas em 3 componentes ortogonais, eliminando multicolinearidade
+sem perda de informação relevante.
+
+**Quando usar:** série histórica densa disponível, previsão operacional sequencial.
+:::
+
+::: {.callout-note}
+## Melhor Modelo — Parte I-B (sem lags)
+
+**`r best_ib_nolag$Modelo`** — RMSE = `r best_ib_nolag$RMSE` °C · MAE = `r best_ib_nolag$MAE` °C · R² = `r best_ib_nolag$R2`
+
+Sem lags, os termos de Fourier (sin/cos anuais e semianuais) capturam a sazonalidade
+de forma contínua e cíclica — janeiro e dezembro ficam naturalmente próximos, algo
+impossível com `month` discreto. A adição de um único `temp_lag1` (modelo meio-termo)
+quase elimina a diferença de RMSE em relação à Parte I-A.
+
+**Quando usar:** observações isoladas sem histórico sequencial (scoring avulso).
+:::
+
+---
+
+# Parte II — Abordagem Não-Supervisionada
+
+```{r cities-def}
+cities <- tribble(
+  ~city,             ~region,         ~lon,    ~lat,
+  "Manaus",          "Norte",        -60.02,  -3.10,
+  "Belém",           "Norte",        -48.48,  -1.46,
+  "Recife",          "Nordeste",     -34.88,  -8.05,
+  "Fortaleza",       "Nordeste",     -38.54,  -3.72,
+  "Salvador",        "Nordeste",     -38.51, -12.97,
+  "Brasília",        "Centro-Oeste", -47.93, -15.78,
+  "Cuiabá",          "Centro-Oeste", -56.10, -15.60,
+  "São Paulo",       "Sudeste",      -46.63, -23.55,
+  "Rio de Janeiro",  "Sudeste",      -43.18, -22.91,
+  "Belo Horizonte",  "Sudeste",      -43.94, -19.92,
+  "Porto Alegre",    "Sul",          -51.23, -30.03,
+  "Curitiba",        "Sul",          -49.27, -25.43
+)
+```
+
+```{r fetch-unsupervised}
+climate_df <- read_csv("data/brazil_monthly.csv", show_col_types = FALSE) |>
+  left_join(cities |> select(city, lon, lat), by = "city") |>
+  mutate(
+    date       = make_date(year, month, 1),
+    temp_range = temp_max - temp_min,
+    season = case_when(
+      month %in% c(12,1,2)  ~ "Verão",
+      month %in% c(3,4,5)   ~ "Outono",
+      month %in% c(6,7,8)   ~ "Inverno",
+      month %in% c(9,10,11) ~ "Primavera"
+    ),
+    season = factor(season, levels = c("Verão","Outono","Inverno","Primavera"))
+  )
+
+cat(sprintf("Dataset: %d linhas | %d cidades | %d anos\n",
+            nrow(climate_df), n_distinct(climate_df$city), n_distinct(climate_df$year)))
+```
+
+## PCA Não-Supervisionado
+
+```{r pca-uns}
+city_profiles <- climate_df |>
+  group_by(city, region) |>
+  summarise(temp_mean  = mean(temp, na.rm=TRUE),
+            temp_range = mean(temp_range, na.rm=TRUE),
+            precip     = mean(precip, na.rm=TRUE),
+            radiation  = mean(radiation, na.rm=TRUE),
+            wind       = mean(wind, na.rm=TRUE),
+            .groups = "drop")
+
+pca_data <- city_profiles |> column_to_rownames("city") |> select(-region)
+X_uns    <- scale(pca_data, center = TRUE, scale = TRUE)
+pca_uns  <- prcomp(X_uns)
+pca_uns$rotation <- -pca_uns$rotation
+pca_uns$x        <- -pca_uns$x
+
+cat("Variância acumulada:\n")
+print(round(cumsum(pca_uns$sdev^2) / sum(pca_uns$sdev^2), 3))
+```
+
+```{r biplot-uns}
+fviz_pca_biplot(pca_uns, repel = TRUE,
+  col.ind = city_profiles$region,
+  palette = c("#E74C3C","#F39C12","#2ECC71","#3498DB","#9B59B6"),
+  addEllipses = TRUE, ellipse.level = 0.70, legend.title = "Região",
+  title = "PCA — Cidades Brasileiras por Perfil Climático",
+  xlab = "PC1 (Temperatura)", ylab = "PC2 (Precipitação)") +
+  theme_minimal(base_size = 13)
+```
+
+## Clustering
+
+```{r kmeans-uns}
+pc_scores <- as.data.frame(pca_uns$x[, 1:2])
+set.seed(42)
+km <- kmeans(pc_scores, centers = 3, nstart = 25)
+city_profiles$cluster <- as.factor(km$cluster)
+
+fviz_cluster(km, data = pc_scores,
+  palette = c("#E74C3C","#2ECC71","#3498DB"),
+  geom = "point", ellipse.type = "convex", pointsize = 4,
+  main = "Clusters de Zonas Climáticas — Brasil") +
+  geom_text(aes(label = rownames(pc_scores)), size=3, vjust=-1) +
+  theme_minimal(base_size = 13)
+
+dist_matrix <- dist(X_uns, method = "euclidean")
+hclust_res  <- hclust(dist_matrix, method = "ward.D2")
+plot(hclust_res, main="Dendrograma — Ward's method",
+     xlab="Cidade", ylab="Distância", sub="", cex=0.9, hang=-1)
+rect.hclust(hclust_res, k=3, border=c("red","green","blue"))
+```
+
+## Decomposição e Forecasting
+
+```{r tsibble}
+climate_ts <- climate_df |>
+  mutate(yearmonth = yearmonth(date)) |>
+  group_by(city, yearmonth) |>
+  summarise(across(c(temp,temp_max,temp_min,precip,wind,radiation,temp_range),
+                   ~mean(.x, na.rm=TRUE)),
+            region=first(region), season=first(season), .groups="drop") |>
+  as_tsibble(key=city, index=yearmonth) |>
+  fill_gaps() |>
+  group_by_key() |>
+  tidyr::fill(temp,temp_max,temp_min,precip,wind,radiation,
+              temp_range,region,season, .direction="downup") |>
+  ungroup()
+```
+
+```{r stl}
+#| fig-height: 9
+stl_t <- climate_ts |> filter(city=="São Paulo") |>
+  model(STL(temp   ~ trend(window=13) + season(window="periodic")))
+stl_p <- climate_ts |> filter(city=="São Paulo") |>
+  model(STL(precip ~ trend(window=13) + season(window="periodic")))
+
+(stl_t |> components() |> autoplot() +
+  labs(title="STL — Temperatura SP") + theme_minimal(base_size=12)) /
+(stl_p |> components() |> autoplot() +
+  labs(title="STL — Precipitação SP") + theme_minimal(base_size=12))
+```
+
+```{r models-temp}
+#| cache: true
+sp_ts    <- climate_ts |> filter(city=="São Paulo")
+sp_train <- sp_ts |> filter(yearmonth <= yearmonth("2022 Dec"))
+sp_test  <- sp_ts |> filter(yearmonth >= yearmonth("2023 Jan"))
+
+models_temp <- sp_train |>
+  model(Naive_Sazonal = SNAIVE(temp), Media_Hist = MEAN(temp),
+        ETS = ETS(temp), ARIMA = ARIMA(temp),
+        STL_ETS = decomposition_model(
+          STL(temp ~ season(window="periodic")), ETS(season_adjust)))
+
+fc_temp  <- models_temp |> forecast(new_data = sp_test)
+acc_temp <- fc_temp |> accuracy(sp_test) |>
+  select(.model, RMSE, MAE, MAPE, MASE) |> arrange(RMSE)
+
+acc_temp |> mutate(across(where(is.numeric), ~round(.,3))) |>
+  knitr::kable(caption = "Acurácia — Temperatura SP (2023–2024)")
+```
+
+```{r heatmap-multi}
+cities_sub <- c("Manaus","Recife","Brasília","São Paulo","Porto Alegre")
+
+models_all <- climate_ts |>
+  filter(city %in% cities_sub, yearmonth <= yearmonth("2022 Dec")) |>
+  model(SNAIVE=SNAIVE(temp), ETS=ETS(temp), ARIMA=ARIMA(temp),
+        STL_ETS=decomposition_model(
+          STL(temp~season(window="periodic")), ETS(season_adjust)))
+
+models_all |>
+  forecast(new_data = climate_ts |>
+             filter(city %in% cities_sub, yearmonth >= yearmonth("2023 Jan"))) |>
+  accuracy(climate_ts |>
+             filter(city %in% cities_sub, yearmonth >= yearmonth("2023 Jan"))) |>
+  select(city, .model, RMSE) |>
+  ggplot(aes(.model, city, fill=RMSE)) +
+  geom_tile(color="white", linewidth=0.6) +
+  geom_text(aes(label=round(RMSE,2)), color="white", fontface="bold", size=3.5) +
+  scale_fill_gradient(low="#2ECC71", high="#E74C3C") +
+  labs(title="Heatmap RMSE — Temperatura por Cidade × Modelo",
+       x="Modelo", y="Cidade", fill="RMSE (°C)") +
+  theme_minimal(base_size=13)
+```
+
+---
+
+# Parte III — São Paulo Está Esquentando?
+
+```{r warming-annual}
+annual_sp <- weather_df |> mutate(year=year(date)) |>
+  group_by(year) |>
+  summarise(temp_mean=mean(temp_mean,na.rm=TRUE), .groups="drop")
+
+lm_trend <- lm(temp_mean ~ year, data=annual_sp)
+slope    <- coef(lm_trend)["year"]
+pval     <- summary(lm_trend)$coefficients["year","Pr(>|t|)"]
+
+cat(sprintf("Taxa: %+.4f °C/ano → %+.3f °C/década | p = %.4f\n",
+            slope, slope*10, pval))
+
+ggplot(annual_sp, aes(year, temp_mean)) +
+  geom_point(size=3, color="#E8583E") +
+  geom_smooth(method="lm", se=TRUE, color="#1D4ED8",
+              fill="#93C5FD", alpha=0.3, linewidth=1.2) +
+  labs(title    = "São Paulo — Temperatura Média Anual (1980–2024)",
+       subtitle = sprintf("Tendência: %+.3f °C/década (p = %.4f)", slope*10, pval),
+       x="Ano", y="Temperatura Média (°C)") +
+  theme_minimal(base_size=13)
+```
+
+---
+
+# Parte IV — Os Clusters Estão Mudando?
+
+```{r temporal-clusters}
+climate_periods <- climate_df |>
+  mutate(period = case_when(year<=1994~"1980–1994",
+                             year<=2009~"1995–2009",
+                             TRUE~"2010–2024"),
+         period = factor(period, levels=c("1980–1994","1995–2009","2010–2024")))
+
+profiles_temporal <- climate_periods |>
+  group_by(city, region, period) |>
+  summarise(across(c(temp,temp_range,precip,radiation,wind),
+                   ~mean(.x,na.rm=TRUE), .names="{.col}_mean"),
+            .groups="drop") |>
+  rename(temp_range=temp_range_mean,
+         precip=precip_mean, radiation=radiation_mean, wind=wind_mean)
+
+run_period_clustering <- function(df, period_label) {
+  prof  <- df |> filter(period==period_label) |>
+    select(city, temp_mean, temp_range, precip, radiation, wind) |>
+    column_to_rownames("city")
+  X_s   <- scale(prof)
+  pca_p <- prcomp(X_s)
+  pc2   <- as.data.frame(pca_p$x[,1:2])
+  set.seed(42)
+  km_p  <- kmeans(pc2, centers=min(3,nrow(pc2)-1), nstart=25)
+  pc2 |> mutate(city=rownames(pc2), cluster=as.factor(km_p$cluster),
+                period=period_label)
+}
+
+map(levels(profiles_temporal$period),
+    ~run_period_clustering(profiles_temporal, .x)) |>
+  list_rbind() |>
+  ggplot(aes(PC1, PC2, color=cluster, label=city)) +
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(size=3, max.overlaps=15) +
+  facet_wrap(~period) +
+  scale_color_manual(values=c("#E74C3C","#2ECC71","#3498DB")) +
+  labs(title="Evolução dos Clusters — Brasil", x="PC1", y="PC2") +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+```
+
+---
+
+# Conclusões — Série Temporal, Clustering e Síntese
+
+## Série Temporal — Forecasting Univariado
+
+```{r conclusao-ts}
+#| echo: false
+best_ts <- acc_temp |> slice_min(RMSE, n = 1)
+
+acc_temp |>
+  mutate(destaque = (.model == best_ts$.model)) |>
+  ggplot(aes(reorder(.model, -RMSE), RMSE, fill = destaque)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = sprintf("%.3f °C", RMSE)),
+            hjust = -0.1, size = 4, fontface = "bold") +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#2ECC71", "FALSE" = "#93C5FD"), guide = "none") +
+  ylim(0, max(acc_temp$RMSE) * 1.3) +
+  labs(title    = "RMSE por Modelo — Temperatura SP (2023–2024)",
+       subtitle = "Verde = melhor modelo de série temporal",
+       x = NULL, y = "RMSE (°C)") +
+  theme_minimal(base_size = 13)
+```
+
+::: {.callout-important}
+## Melhor Modelo de Série Temporal
+
+**`r best_ts$.model`** — RMSE = `r round(best_ts$RMSE, 3)` °C · MAE = `r round(best_ts$MAE, 3)` °C
+
+Modelos que decompõem sazonalidade antes de modelar o resíduo (STL + ETS) tendem a
+superar abordagens puramente paramétricas porque isolam a componente sazonal fixa do
+processo estocástico. O SNAIVE é um baseline sólido — superá-lo exige capturar
+estrutura além da simples repetição do mesmo mês do ano anterior.
+
+**Quando usar:** séries mensais com sazonalidade marcada e histórico longo disponível.
+:::
+
+## Não-Supervisionado — Clustering
+
+::: {.callout-note}
+## Zonas Climáticas Naturais do Brasil
+
+O PCA + K-Means (k = 3) identifica três zonas climáticas consistentes:
+
+- **Tropical Úmida** (Norte — Manaus, Belém): alta temperatura, alta precipitação, baixa amplitude térmica
+- **Tropical Sazonal** (Nordeste/Centro-Oeste): calor intenso, chuvas concentradas no verão, maior radiação
+- **Subtropical** (Sul/Sudeste): amplitude térmica marcada, sazonalidade forte, chuvas bem distribuídas
+
+O clustering hierárquico (Ward's) confirma a mesma estrutura de três grupos —
+concordância entre métodos independentes reforça a validade da segmentação.
+:::
+
+::: {.callout-note}
+## Dinâmica Temporal dos Clusters (Parte IV)
+
+Os perfis climáticos relativos não são estáticos ao longo de 45 anos. Cidades que
+migram de cluster entre períodos indicam transição de zona climática, possivelmente
+associada a urbanização, desmatamento ou aquecimento global. A trajetória no espaço
+Temperatura × Precipitação revela a direção e magnitude dessas mudanças entre os
+períodos 1980–1994, 1995–2009 e 2010–2024.
+:::
+
+## Síntese Final
+
+| Caso de uso | Melhor abordagem | Razão principal |
+|------------|------------------|-----------------|
+| Previsão diária (série densa) | I-A: RF + PCA + Lags | `temp_lag1` domina (autocorr ≈ 0.8) |
+| Previsão sem histórico disponível | I-B: RF Full (Fourier) | Sazonalidade cíclica contínua |
+| Previsão pragmática com 1 lag | I-B: RF + temp_lag1 | Melhor trade-off viés–variância |
+| Forecast mensal univariado | STL + ETS | Decompõe sazonalidade antes do modelo |
+| Segmentação de zonas climáticas | PCA + K-Means (k = 3) | 3 zonas estáveis e interpretáveis |
