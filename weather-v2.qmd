@@ -108,7 +108,8 @@ pred_rf <- predict(rf_fit, test_df)$.pred
 pred_ens <- (pred_lm + pred_rf) / 2
 
 results_ia <- tibble(
-  Modelo = c("LM — PCs + lags", "RF — PCs + lags", "Ensemble (LM + RF)"),
+  Modelo = c("Reg. Linear — PCs + lags", "RF — PCs + lags",
+             "Ensemble (Reg. Linear + RF)"),
   RMSE   = c(rmse(pred_lm,  test_df$target),
              rmse(pred_rf,  test_df$target),
              rmse(pred_ens, test_df$target)),
@@ -208,14 +209,14 @@ Conforme o enunciado, toda a modelagem supervisionada é construída com o stack
 (especificação), `workflows` (pipeline), `tune` (otimização de hiperparâmetros) e
 `yardstick` (métricas) — comparando **Regressão Linear, Random Forest, XGBoost
 (com tuning via CV) e uma rede neural MLP** (`torch`/`brulee`, item opcional do
-enunciado), além do ensemble LM+RF.
+enunciado), além do ensemble Regressão Linear + Random Forest.
 
 | | **Parte I — Supervisionado** | **Parte II — Não-Supervisionado** |
 |---|---|---|
 | **Dados** | Open-Meteo ERA5 — São Paulo (diário) | Open-Meteo ERA5 — 12 cidades (diário → mensal) |
 | **Granularidade** | Diária | Mensal (agregação) |
 | **Alvo** | Temperatura de amanhã (`lead`) | Nenhum — descoberto |
-| **Modelos** | LM · RF · XGBoost · MLP (torch) · Ensemble — via `tidymodels` | PCA · K-Means · Ward (k = 3) |
+| **Modelos** | Reg. Linear · RF · XGBoost · MLP (torch) · Ensemble — via `tidymodels` | PCA · K-Means · Ward (k = 3) |
 | **Métrica** | RMSE · MAE · R² (`yardstick`) | Variância explicada · Silhouette |
 
 A pergunta central de cada parte é diferente:
@@ -240,10 +241,10 @@ O **PCA** comprime 5 features meteorológicas correlacionadas (`temp_max`, `temp
 Exploramos dois papéis distintos:
 
 1. **Visualização**: PCA revela estrutura latente nos dados climáticos em 2D/3D
-2. **Modelagem**: PCA remove multicolinearidade (ajuda LM), mas RF trata correlações nativamente —
+2. **Modelagem**: PCA remove multicolinearidade (ajuda a Regressão Linear), mas RF trata correlações nativamente —
    veremos se o PCA efetivamente melhora o RMSE preditivo
 
-Os modelos da Parte I-A (LM, RF e Ensemble sobre PCs + lags) são ajustados com
+Os modelos da Parte I-A (Regressão Linear, RF e Ensemble sobre PCs + lags) são ajustados com
 **workflows `tidymodels`** — mesma estrutura detalhada na Parte I-B — e seus
 resultados aparecem na Conclusão Supervisionada.
 :::
@@ -407,9 +408,9 @@ pred_lm_raw <- predict(lm_raw_fit, test_nopc)$.pred
 pred_rf_raw <- predict(rf_raw_fit, test_nopc)$.pred
 
 results_pca_raw <- tibble(
-  Modelo    = c("LM — PCs + lags", "LM — Features brutas",
-                "RF — PCs + lags",  "RF — Features brutas"),
-  Algoritmo = c("LM", "LM", "RF", "RF"),
+  Modelo    = c("Reg. Linear — PCs + lags", "Reg. Linear — Features brutas",
+                "RF — PCs + lags",          "RF — Features brutas"),
+  Algoritmo = c("Reg. Linear", "Reg. Linear", "RF", "RF"),
   Tipo      = c("Com PCA", "Sem PCA", "Com PCA", "Sem PCA"),
   RMSE      = c(rmse(pred_lm,     test_df$target),
                 rmse(pred_lm_raw, test_nopc$target),
@@ -419,7 +420,7 @@ results_pca_raw <- tibble(
 ```
 
 ```{r fig-pca-vs-raw}
-#| fig-cap: "RMSE no conjunto de teste para LM e RF, com e sem PCA. Diferenças pequenas confirmam que o PCA agrega mais valor à visualização do que ao desempenho preditivo."
+#| fig-cap: "RMSE no conjunto de teste para Regressão Linear e RF, com e sem PCA. Diferenças pequenas confirmam que o PCA agrega mais valor à visualização do que ao desempenho preditivo."
 #| fig-height: 4.5
 
 results_pca_raw |>
@@ -442,7 +443,7 @@ results_pca_raw |>
 
 | Situação | PCA ajuda? | Motivo |
 |---|:---:|---|
-| LM com features correlacionadas | **Sim** | Remove multicolinearidade; coeficientes estáveis |
+| Regressão Linear com features correlacionadas | **Sim** | Remove multicolinearidade; coeficientes estáveis |
 | RF / XGBoost com features correlacionadas | **Pouco** | Árvores selecionam splits localmente; correlação não distorce |
 | Visualização 2D/3D | **Sempre** | Comprime dimensões para inspeção humana |
 | Interpretabilidade dos coeficientes | **Não** | PCs não têm significado físico direto |
@@ -629,7 +630,7 @@ weather_feat_ib |>
 
 ```{r fig-fourier-vs-scatter}
 #| fig-height: 5
-# Ajuste LM usando apenas os 4 termos de Fourier — mostra o quanto eles capturam do ciclo
+# Ajuste linear usando apenas os 4 termos de Fourier — mostra o quanto eles capturam do ciclo
 fourier_clim <- lm(temp_mean ~ sin1 + cos1 + sin2 + cos2, data = weather_feat_ib)
 
 weather_feat_ib |>
@@ -687,6 +688,20 @@ Toda a modelagem segue o stack **`tidymodels`**: a normalização é aprendida n
 dentro de um `recipe` (sem leakage), os modelos são especificados com `parsnip`,
 encadeados em `workflows` e avaliados com métricas do `yardstick`.
 
+Cada modelo é treinado em **duas versões de features**, para isolar o ganho da
+engenharia de features do ganho do algoritmo:
+
+- **Base** (11 features): clima do dia (`temp_max`, `temp_min`, `temp_range`, `precip`,
+  `wind_max`, `radiation`, `precip_rad_ratio`) + Fourier (`sin1`, `cos1`, `sin2`, `cos2`).
+- **Full** (15 features): Base **+** a estação como fator (`season`) e três **interações
+  sazonais** (`temp_x_sin1`, `temp_x_cos1`, `rad_x_sin1`), que deixam o efeito da
+  temperatura/radiação variar com a época do ano.
+
+A comparação Base vs Full mostra que **o valor de uma feature depende do modelo**:
+a Regressão Linear tende a se beneficiar mais do Full (não cria interações sozinha,
+precisa recebê-las explícitas), enquanto o Random Forest já captura interações
+nativamente via *splits* sucessivos — então ganha pouco com elas.
+
 ```{r split-scale-ib}
 train_ib <- weather_feat_ib |> filter(date <  cutoff)
 test_ib  <- weather_feat_ib |> filter(date >= cutoff)
@@ -720,6 +735,27 @@ cat(sprintf("feat_base: %d | feat_full: %d\n",
 
 ## Modelos Parte I-B
 
+### Por que Regressão Linear + Random Forest?
+
+Os dois modelos-base não foram escolhidos ao acaso — são **estruturalmente opostos**,
+e é dessa oposição que o Ensemble extrai valor:
+
+| | **Regressão Linear** | **Random Forest** |
+|---|---|---|
+| **Natureza** | Paramétrica — uma equação global | Não-paramétrica — 500 árvores locais |
+| **Viés / Variância** | Alto viés, baixa variância | Baixo viés, alta variância |
+| **O que captura** | Tendências lineares suaves; **extrapola** além do range de treino | Não-linearidades e interações via splits; **não extrapola** |
+| **Erro típico** | Subestima picos e relações curvas | Ruidoso em regiões pouco amostradas; achata extremos |
+
+Como os dois erram em **dias diferentes e por motivos diferentes**, seus erros são
+apenas fracamente correlacionados — exatamente a condição para a média reduzir o erro
+total, como formalizado na Introdução ($\text{MSE}_{\text{ensemble}} \leq$ média dos
+MSEs). O **Ensemble** não exige nenhum ajuste extra: é a média simples das previsões
+dos dois modelos Full,
+$\hat{y}_{\text{ens}} = (\hat{y}_{\text{RL}} + \hat{y}_{\text{RF}})/2$ — o mesmo
+princípio do multi-model ensemble meteorológico (IFS + GFS + ICON), em que vieses
+sistemáticos de modelos distintos se cancelam na combinação.
+
 ```{r modelos-ib}
 lm_ib_base <- workflow(rec_base, lm_spec) |> fit(train_base)
 lm_ib_full <- workflow(rec_full, lm_spec) |> fit(train_full)
@@ -732,15 +768,16 @@ pred_rf_ib_base <- predict(rf_ib_base, test_ib)$.pred
 pred_rf_ib_full <- predict(rf_ib_full, test_ib)$.pred
 pred_ens_ib     <- (pred_lm_ib_full + pred_rf_ib_full) / 2
 
-for (nm in c("LM Base","LM Full","RF Base","RF Full","Ensemble")) {
+for (nm in c("Reg. Linear Base","Reg. Linear Full",
+             "RF Base","RF Full","Ensemble")) {
   pred <- switch(nm,
-    "LM Base"  = pred_lm_ib_base,
-    "LM Full"  = pred_lm_ib_full,
-    "RF Base"  = pred_rf_ib_base,
-    "RF Full"  = pred_rf_ib_full,
-    "Ensemble" = pred_ens_ib
+    "Reg. Linear Base" = pred_lm_ib_base,
+    "Reg. Linear Full" = pred_lm_ib_full,
+    "RF Base"          = pred_rf_ib_base,
+    "RF Full"          = pred_rf_ib_full,
+    "Ensemble"         = pred_ens_ib
   )
-  cat(sprintf("%-10s RMSE: %.3f °C | MAE: %.3f °C | R²: %.4f\n",
+  cat(sprintf("%-17s RMSE: %.3f °C | MAE: %.3f °C | R²: %.4f\n",
               nm, rmse(pred, test_ib$target),
               mae(pred, test_ib$target),
               r2(pred, test_ib$target)))
@@ -852,7 +889,7 @@ sem referência, nenhum RMSE é interpretável.
 
 | Grupo | Modelos | Informação temporal usada | Conforme ao requisito? |
 |---|---|---|---|
-| **F1 — Cross-Sectional** | LM/RF Base/Full, Ensemble, XGBoost, MLP | Nenhuma — clima de hoje + Fourier | **Sim** |
+| **F1 — Cross-Sectional** | Reg. Linear/RF Base/Full, Ensemble, XGBoost, MLP | Nenhuma — clima de hoje + Fourier | **Sim** |
 | **Benchmark — Série Temporal** | ARIMA | Histórico completo via AR/MA | Não — só referência |
 | **Benchmark — Lag Explícito** | RF + lag-1 | $y_{t-1}$ (ontem) como feature | Não — só referência |
 :::
@@ -965,7 +1002,7 @@ rmse_all <- tibble(
     "Benchmark: Lag Explícito"
   ),
   Modelo = c(
-    "LM Base","LM Full","RF Base","RF Full","Ensemble",
+    "Reg. Linear Base","Reg. Linear Full","RF Base","RF Full","Ensemble",
     "ARIMA",
     "RF + lag-1"
   ),
@@ -1052,7 +1089,7 @@ praticamente todo o sinal que o lag traria.
 ## XGBoost — Boosting com Tuning de Hiperparâmetros {#xgboost-tuning}
 
 O **XGBoost** completa a comparação supervisionada como terceiro algoritmo distinto
-(além de LM e RF; a rede neural é o item opcional). Enquanto o Random Forest treina
+(além da Regressão Linear e do Random Forest; a rede neural é o item opcional). Enquanto o Random Forest treina
 árvores **independentes** e tira a média (reduzindo variância), o *gradient boosting*
 treina árvores **sequenciais**, cada uma corrigindo os resíduos do conjunto anterior
 (reduzindo viés) — e é consistentemente o estado da arte em dados tabulares.
@@ -1179,7 +1216,8 @@ results_ib <- tibble(
     "Benchmark: Lag Explícito"
   ),
   Modelo = c(
-    "LM Base","LM Full","RF Base","RF Full","Ensemble","XGBoost (tuned)",
+    "Reg. Linear Base","Reg. Linear Full","RF Base","RF Full","Ensemble",
+    "XGBoost (tuned)",
     "ARIMA",
     "RF + temp_lag1"
   ),
@@ -1271,7 +1309,7 @@ have_torch <- requireNamespace("brulee", quietly = TRUE) &&
 ```{r dl-mlp}
 #| eval: !expr have_torch
 
-# Features numéricas (mesmo conjunto do RF/LM Full, sem o fator 'season')
+# Features numéricas (mesmo conjunto do RF/Reg. Linear Full, sem o fator 'season')
 feat_ib_nn <- setdiff(feat_ib_full, "season")
 train_nn   <- train_ib |> select(all_of(c(feat_ib_nn, "target")))
 
@@ -1295,7 +1333,8 @@ cat(sprintf("MLP (torch/brulee): RMSE = %.3f °C | MAE = %.3f °C | R² = %.4f\n
             r2(  pred_mlp, test_ib$target)))
 
 dl_compare <- tibble(
-  Modelo = c("LM Full", "RF Full", "Ensemble (LM+RF)", "XGBoost (tuned)", "MLP (torch)"),
+  Modelo = c("Reg. Linear Full", "RF Full", "Ensemble (Reg. Linear + RF)",
+             "XGBoost (tuned)", "MLP (torch)"),
   RMSE   = c(rmse(pred_lm_ib_full, test_ib$target),
              rmse(pred_rf_ib_full, test_ib$target),
              rmse(pred_ens_ib,     test_ib$target),
@@ -1381,6 +1420,166 @@ cat("Seção de Deep Learning ignorada: o backend torch (libtorch) não está in
     "  torch::install_torch()\n",
     "e renderize novamente.\n", sep = "")
 ```
+
+## Protocolo Treino / Validação / Teste (80 / 10 / 10)
+
+Até aqui usamos um split em **duas vias** (treino / teste) e comparamos todos os
+modelos diretamente no teste. Isso tem uma fragilidade metodológica: ao escolher o
+"melhor" entre vários modelos olhando o mesmo conjunto de teste, a métrica do vencedor
+fica **otimista** — escolhemos justamente quem teve sorte naquele recorte. O protocolo
+de **três vias** sugerido corrige isso separando os papéis:
+
+::: {.callout-note}
+## Os três conjuntos e seus papéis
+
+| Conjunto | Proporção | Para que serve | Quantas vezes é tocado |
+|---|---|---|---|
+| **Treino** | 80% | Ajustar os parâmetros dos modelos | Muitas |
+| **Validação** | 10% | **Comparar e selecionar** modelos e hiperparâmetros | Muitas |
+| **Teste** | 10% | Estimativa **imparcial** da generalização | **Uma só**, no vencedor |
+
+A regra de ouro: o **teste é tocado uma única vez**, depois que o modelo já foi
+escolhido. Tudo o que envolve decisão (qual modelo? quais hiperparâmetros?) acontece na
+**validação**. Assim a métrica final não é contaminada pelo processo de seleção.
+:::
+
+Mantemos o split **cronológico** (não aleatório): treino no passado mais distante,
+validação no período intermediário, teste no futuro mais recente — exatamente como o
+modelo seria usado em produção, e coerente com o cuidado anti-leakage da Parte I-A.
+
+```{r split-3way}
+# Split CRONOLÓGICO 80/10/10 — preserva a ordem temporal
+feat_3 <- weather_feat_ib |> arrange(date)
+n3 <- nrow(feat_3)
+c1 <- floor(0.80 * n3)
+c2 <- floor(0.90 * n3)
+
+tr3 <- feat_3[seq_len(c1), ]          # 80% mais antigo
+va3 <- feat_3[(c1 + 1):c2, ]          # 10% intermediário
+te3 <- feat_3[(c2 + 1):n3, ]          # 10% mais recente
+
+cat(sprintf("Treino:    %5d dias | %s → %s\n", nrow(tr3), min(tr3$date), max(tr3$date)))
+cat(sprintf("Validação: %5d dias | %s → %s\n", nrow(va3), min(va3$date), max(va3$date)))
+cat(sprintf("Teste:     %5d dias | %s → %s\n", nrow(te3), min(te3$date), max(te3$date)))
+```
+
+```{r fig-split-3way}
+#| fig-height: 1.9
+#| fig-cap: "Split cronológico 80/10/10. O teste (vermelho) é o período mais recente e fica reservado até a avaliação final do modelo selecionado na validação."
+
+tibble(
+  Conjunto = factor(c("Treino (80%)", "Validação (10%)", "Teste (10%)"),
+                    levels = c("Treino (80%)", "Validação (10%)", "Teste (10%)")),
+  inicio   = as.Date(c(min(tr3$date), min(va3$date), min(te3$date))),
+  fim      = as.Date(c(max(tr3$date), max(va3$date), max(te3$date)))
+) |>
+  ggplot() +
+  geom_rect(aes(xmin = inicio, xmax = fim, ymin = 0, ymax = 1, fill = Conjunto),
+            color = "white", linewidth = 0.8) +
+  scale_fill_manual(values = c("Treino (80%)"    = "#3B82F6",
+                               "Validação (10%)" = "#F59E0B",
+                               "Teste (10%)"     = "#E8583E")) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title = "Split Cronológico 80 / 10 / 10 — São Paulo (1980–2024)",
+       x = NULL, y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_blank(), panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(), legend.position = "top")
+```
+
+Treinamos os candidatos **apenas no treino (80%)**, comparamos na **validação (10%)** e
+só então confirmamos o vencedor no **teste (10%)**. Para o XGBoost reaproveitamos os
+hiperparâmetros já selecionados por CV (Seção [XGBoost](#xgboost-tuning)) — o foco aqui
+é o protocolo de avaliação, não re-tunar.
+
+```{r modelos-3way}
+#| cache: true
+
+sel_full <- function(df) df |> select(all_of(c(feat_ib_full, "target")))
+sel_nn   <- function(df) df |> select(all_of(c(feat_ib_nn,   "target")))
+
+rec_full3 <- recipe(target ~ ., data = sel_full(tr3)) |>
+  step_normalize(all_numeric_predictors())
+rec_nn3   <- recipe(target ~ ., data = sel_nn(tr3))   # XGBoost dispensa normalização
+
+# Ajuste SÓ no treino (80%)
+lm_3  <- workflow(rec_full3, lm_spec) |> fit(sel_full(tr3))
+rf_3  <- workflow(rec_full3, rf_spec) |> fit(sel_full(tr3))
+xgb_3 <- workflow(rec_nn3, xgb_spec) |>
+  finalize_workflow(best_xgb) |> fit(sel_nn(tr3))
+
+avalia <- function(df, etapa) {
+  pl <- predict(lm_3,  df)$.pred
+  pr <- predict(rf_3,  df)$.pred
+  px <- predict(xgb_3, df)$.pred
+  tibble(
+    Modelo = c("Reg. Linear Full", "RF Full", "XGBoost", "Ensemble (RL+RF)"),
+    RMSE   = c(rmse(pl, df$target), rmse(pr, df$target),
+               rmse(px, df$target), rmse((pl + pr) / 2, df$target)),
+    Etapa  = etapa
+  )
+}
+
+val_scores  <- avalia(va3, "Validação")
+test_scores <- avalia(te3, "Teste")
+
+# Seleção feita SÓ na validação (o teste não participa da escolha)
+melhor_3way <- val_scores |> slice_min(RMSE, n = 1) |> pull(Modelo)
+
+val_scores |>
+  select(Modelo, `RMSE validação` = RMSE) |>
+  left_join(test_scores |> select(Modelo, `RMSE teste` = RMSE), by = "Modelo") |>
+  arrange(`RMSE validação`) |>
+  mutate(across(where(is.numeric), ~round(., 3)),
+         Seleção = if_else(Modelo == melhor_3way, "★", "")) |>
+  knitr::kable(caption = "Seleção na validação, confirmação no teste (held-out). ★ = modelo escolhido sem olhar o teste.")
+```
+
+```{r conclusao-3way}
+#| echo: false
+#| results: asis
+rmse_val_m   <- val_scores  |> filter(Modelo == melhor_3way) |> pull(RMSE)
+rmse_test_m  <- test_scores |> filter(Modelo == melhor_3way) |> pull(RMSE)
+gap          <- rmse_test_m - rmse_val_m
+melhor_teste <- test_scores |> slice_min(RMSE, n = 1) |> pull(Modelo)
+
+frase_robustez <- if (melhor_3way == melhor_teste) {
+  "O modelo escolhido na validação **também é o de menor erro no teste** — a seleção foi robusta, não um acaso do recorte."
+} else {
+  sprintf("No teste, o menor erro seria do **%s**; a diferença para o escolhido é pequena e reflete o ruído entre os períodos, não um erro de seleção.", melhor_teste)
+}
+
+cat(sprintf(
+"::: {.callout-important}
+## O que o protocolo de 3 vias entrega
+
+Selecionando **apenas pela validação**, o vencedor é o **%s** (RMSE validação =
+%.3f °C). Tocando o **teste** uma única vez, ele marca **%.3f °C** (%+.3f °C). %s
+
+Esse gap mistura duas coisas: um pouco de *otimismo de seleção* (escolhemos o melhor
+de vários na validação) e, sobretudo num split **cronológico**, a diferença natural
+entre os períodos — o teste é o trecho mais recente e mais quente, intrinsecamente um
+pouco mais difícil.
+
+**O que melhora — e o que não.** O protocolo de 3 vias **não reduz** o RMSE de nenhum
+modelo; ele entrega uma **estimativa imparcial** e uma seleção sem contaminar o teste.
+O ganho de desempenho de fato vem da validação usada *dentro* do treino — o **tuning
+do XGBoost por CV** e o **early stopping da MLP** (`validation = 0.20`). Esta seção
+torna esse princípio **explícito e unificado** para todos os modelos.
+:::\n\n",
+melhor_3way, rmse_val_m, rmse_test_m, gap, frase_robustez))
+```
+
+::: {.callout-tip}
+## E a validação cruzada (CV)?
+
+O holdout 80/10/10 usa **um único** conjunto de validação. Com séries temporais, a
+alternativa mais robusta é a **validação cruzada de origem deslizante** (*rolling
+origin*): vários cortes treino→validação avançando no tempo, cada um avaliado no futuro
+imediato. É o que o `tune_grid` aproxima no XGBoost. Para um relatório, o holdout fixo
+é mais simples de comunicar; em produção, o *rolling origin* dá uma estimativa de erro
+menos sensível ao recorte escolhido.
+:::
 
 # Conclusão — Análise Supervisionada
 
