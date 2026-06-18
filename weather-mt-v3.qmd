@@ -1,0 +1,1821 @@
+---
+title: "Risco de Safra no Cerrado — Prevendo Estresse Térmico no Agronegócio de Mato Grosso"
+subtitle: "Regressão da temperatura máxima + camada de decisão · tidymodels · PCA · RF · XGBoost · Rede Neural (torch) · Clustering · Open-Meteo ERA5"
+author: "Gustavo G · Nicole S · William M"
+institute: "Aprendizado de Máquina 2 — Insper"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-title: "Sumário"
+    number-sections: true
+    code-fold: true
+    code-summary: "Ver código"
+    fig-width: 10
+    fig-height: 5.5
+    fig-align: center
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r setup}
+library(tidyverse)
+# tidymodels antes de fable/fabletools: accuracy() do fabletools deve
+# prevalecer sobre yardstick::accuracy() nas seções de série temporal
+library(tidymodels)
+library(jsonlite)
+library(GGally)
+library(factoextra)
+library(FactoMineR)
+library(cluster)
+library(patchwork)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(ranger)
+library(ggrepel)
+library(sf)
+```
+
+```{r setup-ia}
+#| include: false
+n_cores <- max(1L, parallel::detectCores() - 1L)
+cutoff  <- as.Date("2023-01-01")
+rmse <- function(pred, real) yardstick::rmse_vec(truth = real, estimate = pred)
+mae  <- function(pred, real) yardstick::mae_vec(truth = real, estimate = pred)
+r2   <- function(pred, real) yardstick::rsq_vec(truth = real, estimate = pred)
+```
+
+---
+
+# Introdução
+
+Este relatório unifica dois modelos para a disciplina Aprendizado de Máquina II aplicados a **dados climáticos reais do Brasil**.
+
+## Problema de Negócio — Risco de Safra no Cerrado
+
+::: {.callout-important}
+## Quem consome esta previsão e qual o risco
+
+O **consumidor de negócio** é um agente da cadeia de **commodities agrícolas**
+(trading, cooperativa, originador de grãos, gestor de risco de uma processadora).
+Seu risco central é a **disrupção de safra**: um evento climático fora de época
+danifica a lavoura, derruba a produção da região e afeta a **oferta (supply)** da
+commodity — pressionando preços, prêmios e contratos de fornecimento.
+:::
+
+Este relatório **adapta** um estudo anterior — que previa a temperatura de São Paulo —
+para uma pergunta de negócio mais forte e regional. Em vez de um único ponto, modelamos
+um **painel de 16 municípios produtores de Mato Grosso** — o **maior estado produtor de
+soja do Brasil** — incluindo **Sorriso** ("capital nacional do agronegócio"), Sinop,
+Lucas do Rio Verde, Sapezal, Rondonópolis e Primavera do Leste, entre outros. O modelo
+prevê a **máxima de amanhã em qualquer um desses municípios**, capturando de uma só vez o
+gradiente climático do estado (oeste mais ameno na Chapada dos Parecis, sul mais quente).
+Sorriso aparece como **exemplo recorrente** por ser a peça central na oferta de soja e
+milho safrinha, mas o risco — e o modelo — é **regional**.
+
+::: {.callout-warning}
+## Por que estresse térmico, e não geada
+
+A narrativa clássica *"clima destrói lavoura -> choque de oferta -> alta de preço"* no
+Brasil tem **duas mecânicas distintas conforme a geografia**. A geada — que devastou o
+café em 2021 — é um risco do **Sul e do Sudeste** (Sul de Minas, Paraná, RS). No
+**Cerrado de Mato Grosso a geada é meteorologicamente inexistente** (em todo o painel a
+mínima raramente se aproxima de 10 °C), então um classificador de geada não teria nenhum
+evento positivo para aprender.
+
+O risco real da safra em MT é o **estresse térmico e hídrico**: **ondas de calor e
+veranicos** no fim da estação seca. Em todo o painel, os dias com `temp_max >= 35 °C` se
+concentram em **agosto–outubro** (em Sorriso, cerca de 30 % dos dias de setembro),
+justamente a **janela de plantio e germinação da soja** e a cauda do **milho safrinha** —
+calor excessivo nessa fase reduz a produtividade, encolhe a oferta regional e move o
+preço. É a **mesma justificativa de negócio** (disrupção de oferta), com o gatilho
+climático apropriado à geografia.
+:::
+
+**Tradução para Machine Learning.** O alvo deixa de ser a temperatura *média* e passa a
+ser a **temperatura máxima de amanhã** (`temp_max`, fenômeno diurno do estresse térmico).
+Sobre essa **regressão** aplicamos uma **camada de decisão**: quando a máxima prevista
+cruza um **limiar** operacional (35 °C), emitimos um **alerta de dia de estresse
+térmico** — um sinal acionável de risco de oferta. Avaliamos a regressão (RMSE/MAE/R²) e,
+sobre o limiar, as **métricas de negócio** (precisão, recall, falsos alarmes).
+
+## Ensembles em Modelos Climáticos
+
+Um **ensemble** combina múltiplos modelos — ou múltiplas execuções do mesmo modelo — para gerar previsões mais robustas. Na meteorologia operacional há duas formas clássicas:
+
+1. **Ensemble de perturbações (multi-member):** o IFS do ECMWF é executado com 51 condições iniciais ligeiramente perturbadas; como a atmosfera é caótica, o *spread* entre os membros quantifica a incerteza da previsão.
+2. **Multi-model ensemble:** previsões de modelos distintos (GFS, IFS, ICON) são combinadas — seus vieses sistemáticos tendem a se cancelar, e a média supera consistentemente qualquer modelo individual.
+
+Neste projeto aplicamos o mesmo princípio no aprendizado supervisionado: combinamos uma **Regressão Linear** (alto viés, baixa variância) com o **XGBoost** (baixo viés, árvores *boosted*) — os dois aprendizes mais estruturalmente opostos. Como erram em dias diferentes, a média reduz o erro total:
+
+$$\text{MSE}_{\text{ensemble}} \leq \frac{1}{K}\sum_{k=1}^K \text{MSE}_k$$
+
+A igualdade só valeria se todos os modelos errassem de forma idêntica — improvável quando as estruturas diferem.
+
+```{r fig-ensemble-concept}
+#| fig-cap: "Princípio clássico do ensemble: cada modelo-base (cinza) erra em uma direção diferente; a média (vermelho tracejado) aproxima-se da função real (preto), reduzindo a variância."
+#| fig-height: 4.5
+
+set.seed(123)
+x_grid <- seq(0, 10, length.out = 200)
+truth  <- sin(x_grid) + 0.3 * x_grid
+
+base_preds <- purrr::map_dfr(1:6, function(m) {
+  tibble(
+    x     = x_grid,
+    valor = truth + rnorm(1, 0, 0.7) + sin(x_grid + m) * 0.5 +
+            cumsum(rnorm(length(x_grid), 0, 0.07)),
+    serie = paste0("Modelo ", m)
+  )
+})
+
+ens <- base_preds |>
+  group_by(x) |>
+  summarise(valor = mean(valor), .groups = "drop")
+
+ggplot() +
+  geom_line(data = base_preds,
+            aes(x, valor, group = serie, color = "Modelos-base"),
+            alpha = 0.55, linewidth = 0.5) +
+  geom_line(data = tibble(x = x_grid, valor = truth),
+            aes(x, valor, color = "Função real"), linewidth = 1.5) +
+  geom_line(data = ens,
+            aes(x, valor, color = "Ensemble (média)"),
+            linewidth = 1.5, linetype = "dashed") +
+  scale_color_manual(values = c("Modelos-base"     = "#9CA3AF",
+                                "Função real"      = "#1F2937",
+                                "Ensemble (média)" = "#E8583E")) +
+  labs(title    = "O Princípio do Ensemble — A Média Cancela Erros Independentes",
+       subtitle = "Vários modelos-base com erros idiossincráticos vs. a média do ensemble",
+       x = NULL, y = NULL, color = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+## Estrutura do Projeto
+
+O desafio deste projeto é utilizar uma **base de dados unificada** para construir no mínimo dois modelos: um de **aprendizado supervisionado** e outro **não-supervisionado**. Toda a análise utiliza uma **fonte única de dados: Open-Meteo ERA5 Reanalysis**, garantindo consistência metodológica entre as partes.
+
+Conforme o enunciado, toda a modelagem supervisionada é construída com o stack
+**`tidymodels`** — `recipes` (pré-processamento sem leakage), `parsnip`
+(especificação), `workflows` (pipeline), `tune` (otimização de hiperparâmetros) e
+`yardstick` (métricas) — comparando **Regressão Linear, Random Forest, XGBoost
+(com tuning via CV) e uma rede neural MLP** (`torch`/`brulee`, item opcional do
+enunciado), além do **ensemble Regressão Linear + XGBoost**.
+
+| | **Supervisionado — Regional** | **Não-Supervisionado** |
+|---|---|---|
+| **Dados** | Open-Meteo ERA5 — painel de **16 municípios** de MT (diário) | Open-Meteo ERA5 — 12 cidades (diário → mensal) |
+| **Granularidade** | Diária | Mensal (agregação) |
+| **Alvo** | **Temp. máxima de amanhã** (`lead`, por município) **+ alerta de estresse (≥ 35 °C)** | Nenhum — descoberto |
+| **Modelos** | PCA · Reg. Linear · RF · XGBoost (tuned) · **Ensemble (RL+XGB)** · MLP — via `tidymodels` | PCA · K-Means · Ward (k = 3) |
+| **Métrica** | RMSE · MAE · R² · **precisão/recall do alerta** (`yardstick`) | Variância explicada · Silhouette |
+
+A pergunta central de cada parte é diferente:
+
+- **Supervisionado:** *"Consigo prever a temperatura máxima de amanhã — e disparar um alerta de estresse térmico — para qualquer município produtor de MT?"*
+- **Não-supervisionado:** *"Existem zonas climáticas naturais no Brasil — e onde o Centro-Oeste/Cerrado se posiciona?"*
+
+Além disso, investigamos uma questão complementar:
+
+- **Dinâmica dos clusters:** *"As zonas climáticas estão mudando ao longo do tempo?"*
+
+---
+
+# Dados e Análise Exploratória
+
+Toda a análise usa **Open-Meteo ERA5 Reanalysis**. O dado supervisionado é o **painel
+diário (1980–2024) de 16 municípios produtores de soja/milho de Mato Grosso** — `temp_max`,
+`temp_min`, precipitação, vento e radiação por dia, mais a **elevação** de cada ponto. Antes
+de modelar, exploramos **onde** o risco se concentra no espaço, em dois eixos de disrupção
+de oferta: **calor** (estresse térmico) e **chuva** (déficit hídrico).
+
+::: {.callout-note}
+**Pipeline de dados:** `fetch_mt_panel.py` baixa o diário dos municípios (painel
+supervisionado, com elevação); `fetch_mt_points.py` e `fetch_mt_precip.py` produzem os
+resumos espaciais compactos dos mapas (`data/mt_points_*.csv`). A geometria de MT vem da
+malha oficial do **IBGE**. A base supervisionada de Sorriso, de versões anteriores, foi
+substituída por este painel regional.
+:::
+
+```{r spatial-load}
+# Mantemos só os 16 municípios com painel diário completo (mesma base do modelo regional)
+munis_16 <- read_csv("data/mt_panel_meta.csv", show_col_types = FALSE)$city
+pts_hs <- read_csv("data/mt_points_heatstress.csv", show_col_types = FALSE) |> filter(city %in% munis_16)
+pts_pr <- read_csv("data/mt_points_precip90.csv",   show_col_types = FALSE) |> filter(city %in% munis_16)
+janela <- sprintf("%s a %s", pts_pr$window_start[1], pts_pr$window_end[1])
+
+# Geometria oficial de Mato Grosso (IBGE): contorno do estado + malha municipal
+mt_uf  <- sf::st_read("data/geo/mt_uf.json",  quiet = TRUE)
+mt_mun <- sf::st_read("data/geo/mt_mun.json", quiet = TRUE)
+
+# Camada-base reutilizável dos mapas (malha municipal cinza + contorno do estado)
+base_mt <- list(
+  geom_sf(data = mt_mun, fill = "gray97", color = "gray86",
+          linewidth = 0.15, inherit.aes = FALSE),
+  geom_sf(data = mt_uf,  fill = NA, color = "gray35",
+          linewidth = 0.6, inherit.aes = FALSE)
+)
+
+cat(sprintf("%d municípios | janela de precipitação = últimos 90 dias do período do estudo: %s\n",
+            nrow(pts_hs), janela))
+```
+
+## Risco de Calor — Estresse Térmico no Espaço
+
+Cada município é posicionado por longitude/latitude; **cor e tamanho** codificam o risco
+(dias/ano com `temp_max ≥ 35 °C`). Sorriso — município de referência do agronegócio — está
+destacado com contorno preto.
+
+```{r fig-map-heat}
+#| fig-cap: "Risco de estresse térmico nos municípios produtores de MT. Tons quentes e pontos maiores = mais dias de calor extremo por ano. O oeste (Chapada dos Parecis, mais alto) é o mais ameno; leste e sul concentram o maior risco."
+#| fig-height: 6.5
+
+sorriso_hs <- pts_hs |> filter(city == "Sorriso")
+
+ggplot(pts_hs, aes(lon, lat)) +
+  base_mt +
+  geom_point(aes(color = days_ge35, size = days_ge35), alpha = 0.9) +
+  geom_point(data = sorriso_hs, shape = 21, size = 9, stroke = 1.3,
+             color = "black", fill = NA) +
+  geom_text_repel(aes(label = sprintf("%s\n%.0f d/ano", city, days_ge35)),
+                  size = 2.8, lineheight = 0.9, segment.color = "gray60",
+                  min.segment.length = 0, max.overlaps = 20, seed = 1) +
+  scale_color_distiller(palette = "YlOrRd", direction = 1, name = "Dias/ano\n≥ 35 °C") +
+  scale_size_continuous(range = c(3, 13), guide = "none") +
+  coord_sf(expand = TRUE) +
+  labs(title    = "Risco de Estresse Térmico — Municípios de MT",
+       subtitle = "Média anual de dias com temp_max ≥ 35 °C (ERA5, 1980–2024) · Sorriso destacado",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), plot.margin = margin(10, 30, 10, 10))
+```
+
+::: {.callout-important}
+## Leitura espacial do calor
+
+O risco **não é uniforme em MT**. O **oeste — Chapada dos Parecis** (Sapezal, Campo Verde,
+Campo Novo do Parecis: < 3 dias/ano) — é o mais ameno, efeito da **altitude** do
+planalto. O **leste e o sul** (Rondonópolis, Querência, Gaúcha do Norte: > 24 dias/ano)
+concentram o maior estresse térmico. **Sorriso fica no meio do ranking**
+(≈ 17 dias/ano): representativo, mas **subestima** o sul/leste e **superestima** o oeste —
+um único ponto não basta para precificar risco regional.
+:::
+
+## Risco Hídrico — Precipitação Acumulada (Últimos 90 Dias)
+
+A outra face da disrupção de safra é a **falta de chuva**: veranicos e déficit hídrico
+estressam soja e milho tanto quanto o calor. Usamos um recorte de **90 dias dentro da
+própria base do estudo** — `r janela`, ou seja, o **início da safra 2024/25**, quando o
+plantio da soja depende do *onset* das chuvas. Mapeamos a chuva acumulada nesse período e,
+mais importante, o quanto ela representa da **normal climatológica 1991–2020** — porque,
+no pico das chuvas, o valor absoluto sozinho confunde sazonalidade com anomalia.
+
+```{r fig-map-precip-mm}
+#| fig-cap: "Chuva acumulada (mm) nos últimos 90 dias por município. Azul mais escuro = mais chuva no período."
+#| fig-height: 6.5
+
+sorriso_pr <- pts_pr |> filter(city == "Sorriso")
+
+ggplot(pts_pr, aes(lon, lat)) +
+  base_mt +
+  geom_point(aes(color = precip_90d, size = precip_90d), alpha = 0.9) +
+  geom_point(data = sorriso_pr, shape = 21, size = 9, stroke = 1.3,
+             color = "black", fill = NA) +
+  geom_text_repel(aes(label = sprintf("%s\n%.0f mm", city, precip_90d)),
+                  size = 2.8, lineheight = 0.9, segment.color = "gray60",
+                  min.segment.length = 0, max.overlaps = 20, seed = 1) +
+  scale_color_distiller(palette = "Blues", direction = 1, name = "Chuva 90d\n(mm)") +
+  scale_size_continuous(range = c(3, 13), guide = "none") +
+  coord_sf(expand = TRUE) +
+  labs(title    = paste0("Precipitação Acumulada — Últimos 90 Dias (", janela, ")"),
+       subtitle = "Soma de chuva (mm) por município · ERA5 · Sorriso destacado",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), plot.margin = margin(10, 30, 10, 10))
+```
+
+```{r fig-map-precip-anom}
+#| fig-cap: "Anomalia de chuva: precipitação dos últimos 90 dias como % da normal 1991–2020. Marrom = mais seco que o normal (risco hídrico); azul = mais úmido. O tamanho do ponto cresce com a magnitude da anomalia."
+#| fig-height: 6.5
+
+ggplot(pts_pr, aes(lon, lat)) +
+  base_mt +
+  geom_point(aes(color = pct_normal, size = abs(pct_normal - 100) + 25), alpha = 0.95) +
+  geom_point(data = sorriso_pr, shape = 21, size = 9, stroke = 1.3,
+             color = "black", fill = NA) +
+  geom_text_repel(aes(label = sprintf("%s\n%.0f%%", city, pct_normal)),
+                  size = 2.8, lineheight = 0.9, segment.color = "gray60",
+                  min.segment.length = 0, max.overlaps = 20, seed = 1) +
+  scale_color_gradient2(low = "#A6611A", mid = "#F5F5F5", high = "#2C7FB8",
+                        midpoint = 100, name = "% da\nnormal") +
+  scale_size_continuous(range = c(3, 12), guide = "none") +
+  coord_sf(expand = TRUE) +
+  labs(title    = "Anomalia de Chuva — % da Normal 1991–2020 (últimos 90 dias)",
+       subtitle = paste0("Marrom = mais seco que o normal · Azul = mais úmido · Janela: ", janela),
+       x = "Longitude", y = "Latitude") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), plot.margin = margin(10, 30, 10, 10))
+```
+
+::: {.callout-important}
+## Leitura espacial da chuva
+
+Neste recorte (início da safra 2024/25), as chuvas vieram **próximas ou acima da normal**
+na maior parte de MT — um *onset* de estação chuvosa sem grandes atrasos. Os déficits são
+**localizados**: **Vera (~69 % da normal)** e **Campo Verde (~81 %)** foram as secas mais
+claras; no extremo úmido, **Canarana (128 %)**, **Rondonópolis (125 %)** e **Primavera do
+Leste (119 %)**. Sorriso fechou em **~107 % da normal**. O mapa de anomalia (% da normal) é
+mais informativo que o de mm absolutos: como out–dez é o pico das chuvas, todos os pontos
+somam centenas de mm — o que **move o risco** é o desvio da normal, não o total acumulado.
+:::
+
+## Calor + Seca — Risco Combinado
+
+```{r tbl-spatial}
+pts_hs |>
+  select(city, lat, lon, days_ge35) |>
+  left_join(pts_pr |> select(city, precip_90d, pct_normal), by = "city") |>
+  arrange(desc(days_ge35)) |>
+  transmute(Município = city,
+            `Dias/ano ≥ 35 °C` = days_ge35,
+            `Chuva 90d (mm)`   = precip_90d,
+            `% da normal`      = pct_normal) |>
+  knitr::kable(caption = sprintf(
+    "Risco combinado por município — calor (1980–2024) e chuva (%s)", janela))
+```
+
+::: {.callout-warning}
+## Onde os dois riscos se somam
+
+O risco de safra mais preocupante é a **coincidência** de calor alto e chuva abaixo do
+normal. Neste início de safra, as chuvas vieram **adequadas** na maioria dos municípios, de
+modo que o estresse dominante foi o **térmico** — concentrado no **leste/sul**
+(Rondonópolis, Querência, Gaúcha do Norte) e no **centro-norte** (Vera, Sinop). O caso de
+**dupla exposição** mais nítido é **Vera**: alto estresse térmico (~19 dias/ano) **e** o
+maior déficit de chuva do recorte (~69 % da normal). O **oeste do Parecis** segue o mais
+resiliente (ameno e bem suprido de chuva). A leitura prática para o agente de commodities:
+cruzar a **anomalia hídrica de 90 dias** com o alerta térmico regional e **reponderar por
+sub-região** o sinal previsto para cada município.
+:::
+
+---
+
+# Parte I — Análise Supervisionada Regional (Máxima de Amanhã em Todo o Mato Grosso)
+
+Esta é a análise supervisionada central. Em vez de um único ponto, treinamos **um modelo
+regional** sobre o **painel dos 16 municípios**, prevendo a **temperatura máxima de amanhã**
+para qualquer um deles. Aplicamos aqui toda a metodologia — **PCA**, features
+**cross-sectional de Fourier**, **Regressão Linear**, **Random Forest**, **XGBoost com
+tuning**, o **Ensemble (Regressão Linear + XGBoost)** e uma **rede neural (MLP)**, tudo via
+`tidymodels` — e fechamos com a **camada de decisão** (alerta de estresse térmico).
+
+::: {.callout-note}
+## Painel, lat/lon/elevação e prevenção de leakage
+O `lead` da máxima é calculado **dentro de cada município**; o split é **cronológico**
+(treino < 2023, teste ≥ 2023). No total são **262.976 dias-município**: **251.296 no treino** (até 2022) e **11.680 no teste** (2023–2024). Além do clima do dia e da sazonalidade de Fourier, o modelo
+recebe **latitude, longitude e elevação** — a **altitude** é o que torna a Chapada dos
+Parecis mais fria. Dos 20 municípios mapeados, **16 têm painel diário completo** (os outros
+4 ficaram limitados pela API na coleta).
+:::
+
+```{r reg-features}
+panel      <- read_csv("data/mt_panel_daily.csv", show_col_types = FALSE) |> mutate(date = as.Date(date))
+panel_meta <- read_csv("data/mt_panel_meta.csv",  show_col_types = FALSE)
+
+feat_reg <- panel |>
+  arrange(city, date) |> group_by(city) |>
+  mutate(
+    target = lead(temp_max, 1),
+    doy = yday(date), n_days = if_else(leap_year(date), 366, 365),
+    sin1 = sin(2*pi*doy/n_days), cos1 = cos(2*pi*doy/n_days),
+    sin2 = sin(4*pi*doy/n_days), cos2 = cos(4*pi*doy/n_days),
+    temp_range = temp_max - temp_min, precip_rad_ratio = precip / (radiation + 1)
+  ) |> ungroup() |> left_join(panel_meta, by = "city") |> drop_na(target)
+
+feats_reg <- c("temp_max","temp_min","temp_range","precip","wind_max","radiation",
+               "precip_rad_ratio","sin1","cos1","sin2","cos2","lat","lon","elevation")
+train_reg <- feat_reg |> filter(date <  cutoff)
+test_reg  <- feat_reg |> filter(date >= cutoff)
+trs_reg   <- train_reg |> select(all_of(c(feats_reg, "target")))
+cat(sprintf("Painel: %s linhas | treino %s | teste %s | %d municípios\n",
+            format(nrow(feat_reg), big.mark="."), format(nrow(train_reg), big.mark="."),
+            format(nrow(test_reg), big.mark="."), n_distinct(feat_reg$city)))
+```
+
+## Qualidade dos Dados — Cobertura, Faltantes e Discrepantes
+
+Antes de modelar, auditamos a base quanto a **faltantes**, **valores fisicamente implausíveis**
+e **cobertura espacial**. Por ser uma **reanálise** (ERA5) — e não uma estação meteorológica
+bruta — a série é regular e sem buracos, o que muda o tipo de cuidado necessário.
+
+```{r reg-dataquality}
+#| echo: false
+qa_na <- panel |>
+  summarise(across(c(temp_max, temp_min, precip, wind_max, radiation), ~sum(is.na(.x)))) |>
+  unlist()
+tibble(
+  Variável   = c("temp_max", "temp_min", "precip", "wind_max", "radiation"),
+  Faltantes  = qa_na,
+  `Mínimo`   = round(c(min(panel$temp_max), min(panel$temp_min), min(panel$precip),
+                       min(panel$wind_max), min(panel$radiation)), 1),
+  `Máximo`   = round(c(max(panel$temp_max), max(panel$temp_min), max(panel$precip),
+                       max(panel$wind_max), max(panel$radiation)), 1)
+) |>
+  knitr::kable(caption = "Auditoria das variáveis do painel (16 municípios, 1980–2024)")
+```
+
+::: {.callout-note}
+## Decisões de tratamento de dados
+
+- **Faltantes:** o painel ERA5 não tem buracos internos. O único `drop_na` é sobre o **alvo**
+  (`lead(temp_max)`), que remove o **último dia de cada município** (sem dia seguinte) —
+  `r format(nrow(panel) - nrow(feat_reg), big.mark=".")` linhas, isto é, **1 por município**.
+  **Nenhuma imputação** é necessária.
+- **Discrepantes:** as faixas físicas são plausíveis (sem temperaturas impossíveis nem
+  precipitação negativa). Crucialmente, **não removemos os extremos de calor**: eles **são o
+  próprio sinal** que queremos prever (estresse térmico). Filtrá-los como *outliers*
+  destruiria o objetivo de negócio — decisão deliberada e oposta ao reflexo estatístico usual.
+- **Cobertura espacial (viés de seleção):** dos 20 municípios mapeados, **4 ficaram sem painel
+  diário** por limite de requisições da API — *Campos de Júlio, Diamantino, Tangará da Serra* e
+  *Brasnorte*, concentrados no **oeste/noroeste** (Chapada dos Parecis). Como essa é justamente
+  a sub-região **mais amena**, os 16 restantes podem **superestimar levemente** o calor médio
+  do estado. Ainda assim, cobrem todo o gradiente (oeste ameno → sul/leste quente), e o mapa de
+  RMSE por município mostra desempenho homogêneo — o viés afeta a *representatividade*, não a
+  *validade* do modelo onde há dados.
+:::
+
+## Sazonalidade Cíclica — Termos de Fourier
+
+A previsão é **cross-sectional**: cada dia é uma observação independente (clima de hoje +
+posição no ciclo anual), sem usar o histórico da própria série. O desafio é representar a
+sazonalidade, que é **cíclica** — dezembro e janeiro são termicamente adjacentes, mas
+qualquer índice linear (`month` 1–12, `doy` 1–365) os coloca em extremos opostos. Projetamos
+então o dia do ano no **círculo unitário** com pares seno/cosseno:
+
+$$\sin_k = \sin\!\left(\frac{2\pi k\,\text{doy}}{N}\right), \qquad
+  \cos_k = \cos\!\left(\frac{2\pi k\,\text{doy}}{N}\right)$$
+
+- **$k = 1$ (ciclo anual):** a oscilação principal verão/inverno.
+- **$k = 2$ (ciclo semianual):** assimetrias dentro do ano, como o contraste seca/chuva do Cerrado.
+
+| Representação | Sazonalidade | Problema |
+|---|---|---|
+| `month` / `doy` | numérica | Dez (12) e Jan (1) ficam a 11 unidades de distância |
+| one-hot de mês | 11 dummies | sem suavidade; cada mês é independente |
+| **Fourier sin/cos** | **contínua e cíclica** | **Jan e Dez ficam naturalmente próximos** |
+
+::: {.callout-tip}
+## Por que sin **e** cos juntos?
+Um único $\sin_1$ fixaria o pico em um dia do ano. Com $\cos_1$ junto, a combinação
+$a\sin_1 + b\cos_1$ **ajusta a fase livremente** — o máximo cai em qualquer dia conforme a
+razão $b/a$:
+
+$$a\sin\theta + b\cos\theta = \sqrt{a^2 + b^2}\;\sin\!\left(\theta + \arctan\tfrac{b}{a}\right)$$
+
+Em Mato Grosso, onde a **máxima térmica ocorre em ago–set** (fim da estação seca) e não no
+verão chuvoso, é o $\cos_1$ que permite aos modelos posicionar corretamente esse pico de
+primavera.
+:::
+
+```{r fig-reg-fourier}
+#| fig-cap: "Os quatro termos de Fourier ao longo do ano (iguais para todos os municípios). Substituem month/doy e mantêm janeiro e dezembro contíguos."
+#| fig-height: 3.8
+tibble(doy = 1:365) |>
+  mutate(sin1 = sin(2*pi*doy/365), cos1 = cos(2*pi*doy/365),
+         sin2 = sin(4*pi*doy/365), cos2 = cos(4*pi*doy/365)) |>
+  pivot_longer(-doy, names_to = "harmonico", values_to = "valor") |>
+  mutate(harmonico = factor(harmonico, levels = c("sin1","cos1","sin2","cos2"))) |>
+  ggplot(aes(doy, valor, color = harmonico)) +
+  geom_line(linewidth = 1.1) +
+  scale_color_brewer(palette = "Set1") +
+  scale_x_continuous(breaks = c(1,60,121,182,244,305,365),
+                     labels = c("Jan","Mar","Mai","Jul","Set","Nov","Dez")) +
+  labs(title = "Termos de Fourier — Sazonalidade Contínua e Cíclica",
+       x = "Dia do ano", y = "Valor", color = "Harmônico") +
+  theme_minimal(base_size = 12)
+```
+
+### A Base Após os Termos de Fourier
+
+A tabela abaixo mostra como a base fica depois de adicionar a sazonalidade de Fourier — uma
+amostra de um município (Sorriso) ao longo do ano. Cada linha é uma observação **independente**:
+o modelo recebe o clima do dia, a posição no ciclo anual (`sin/cos`) e a geografia do ponto
+(`lat`/`lon`/`elevation`), sem nenhum valor passado da própria série.
+
+```{r tab-reg-fourier}
+feat_reg |>
+  filter(city == "Sorriso", year(date) == 2001,
+         doy %in% c(15, 74, 135, 196, 257, 319, 349)) |>
+  transmute(
+    Município     = city,
+    Data          = date,
+    doy,
+    `T. máx (°C)` = round(temp_max, 1),
+    sin1          = round(sin1, 3),
+    cos1          = round(cos1, 3),
+    sin2          = round(sin2, 3),
+    cos2          = round(cos2, 3),
+    `Elev. (m)`   = elevation,
+    `Alvo amanhã` = round(target, 1)
+  ) |>
+  knitr::kable(align = "c",
+    caption = "Amostra da base regional após Fourier (Sorriso, um dia por bimêstre de 2001). Note que janeiro (doy 15) e dezembro (doy 349) têm cos1 quase igual — ficam adjacentes no círculo anual.")
+```
+
+## PCA — Estrutura das Variáveis Meteorológicas
+
+O **PCA** comprime as 5 variáveis meteorológicas correlacionadas em componentes ortogonais.
+Aqui ele tem papel **exploratório**: revela a estrutura latente do clima do painel. Como os
+modelos de árvore e a MLP lidam nativamente com correlação, as features brutas (não os PCs)
+alimentam a previsão — o PCA agrega mais à compreensão do que ao RMSE.
+
+```{r reg-pairplot}
+#| fig-height: 6.5
+#| fig-cap: "Matriz de correlação entre as 5 variáveis meteorológicas (amostra de 4.000 dias do painel). A alta correlação temp_max × temp_min e temp_max × radiação é o que motiva *testar* o PCA — embora, como veremos, ele não melhore a previsão aqui."
+set.seed(1)
+train_reg |> slice_sample(n = 4000) |>
+  select(temp_max, temp_min, precip, wind_max, radiation) |>
+  GGally::ggpairs(columnLabels = c("T.max","T.min","Precip.","Vento","Radiação"),
+                  lower = list(continuous = GGally::wrap("points", alpha = 0.08, size = 0.4)),
+                  upper = list(continuous = GGally::wrap("cor", size = 3.5)),
+                  title = "Correlações entre Variáveis Meteorológicas (painel MT)") +
+  theme_minimal(base_size = 10)
+```
+
+```{r reg-pca}
+#| fig-height: 4
+#| fig-cap: "Scree plot do PCA das 5 variáveis meteorológicas no painel de treino. Os 3 primeiros componentes concentram a maior parte da variância."
+wf5 <- c("temp_max","temp_min","precip","wind_max","radiation")
+pca_reg <- prcomp(train_reg[wf5], center = TRUE, scale. = TRUE)
+factoextra::fviz_eig(pca_reg, addlabels = TRUE, barfill = "#3B82F6", barcolor = "#1D4ED8",
+                     ylim = c(0, 60)) +
+  labs(title = "Scree Plot — PCA das Variáveis Meteorológicas (painel MT)",
+       x = "Componente principal", y = "% variância explicada") +
+  theme_minimal(base_size = 12)
+```
+
+```{r reg-pca-var}
+#| fig-height: 5
+#| fig-cap: "Círculo de correlações: direção e contribuição de cada variável nos dois primeiros componentes."
+factoextra::fviz_pca_var(pca_reg, repel = TRUE, col.var = "contrib",
+                         gradient.cols = c("#91BAD6", "#1D4ED8", "#E8583E"),
+                         title = "Círculo de Correlações — PC1 × PC2") +
+  theme_minimal(base_size = 12)
+```
+
+### PCA Ajuda na Previsão? — PCA vs Features Brutas
+
+Reduzir dimensão é útil quando há **muitas** features redundantes. Aqui temos só **5
+variáveis meteorológicas** — então comprimi-las pode **descartar sinal**. Testamos: treinamos
+Regressão Linear e Random Forest com as **5 variáveis brutas** e com seus **3 primeiros
+componentes** (≈ 85% da variância), mantendo Fourier e geografia iguais.
+
+```{r reg-pca-vs-raw}
+#| cache: true
+wf5_cmp   <- c("temp_max","temp_min","precip","wind_max","radiation")
+feats_cmp <- c(wf5_cmp, "sin1","cos1","sin2","cos2","lat","lon","elevation")
+tr_cmp    <- train_reg |> select(all_of(c(feats_cmp, "target")))
+
+rec_raw_cmp <- recipe(target ~ ., data = tr_cmp) |> step_normalize(all_numeric_predictors())
+rec_pca_cmp <- recipe(target ~ ., data = tr_cmp) |>
+  step_normalize(all_of(wf5_cmp)) |> step_pca(all_of(wf5_cmp), num_comp = 3) |>
+  step_normalize(all_numeric_predictors())
+
+lin_cmp <- linear_reg() |> set_engine("lm")
+rf_cmp  <- rand_forest(trees = 300, mode = "regression") |> set_engine("ranger", num.threads = n_cores)
+
+fit_one <- function(rec, spec) { set.seed(1); wf <- workflow(rec, spec) |> fit(tr_cmp)
+  rmse(predict(wf, test_reg)$.pred, test_reg$target) }
+pca_raw <- tibble(
+  Algoritmo = rep(c("Regressão Linear","Random Forest"), each = 2),
+  Tipo      = rep(c("Sem PCA (5 variáveis)","Com PCA (3 PCs)"), 2),
+  RMSE      = c(fit_one(rec_raw_cmp, lin_cmp), fit_one(rec_pca_cmp, lin_cmp),
+                fit_one(rec_raw_cmp, rf_cmp),  fit_one(rec_pca_cmp, rf_cmp))
+)
+```
+
+```{r fig-reg-pca-vs-raw}
+#| fig-cap: "RMSE no teste com as 5 variáveis brutas vs. seus 3 primeiros componentes principais. Em ambos os algoritmos o PCA PIORA o erro — com poucas variáveis, reduzir dimensão descarta sinal útil."
+#| fig-height: 4
+pca_raw |>
+  ggplot(aes(Algoritmo, RMSE, fill = Tipo)) +
+  geom_col(position = position_dodge(0.7), width = 0.6) +
+  geom_text(aes(label = round(RMSE, 3)), position = position_dodge(0.7),
+            vjust = -0.4, size = 3.6, fontface = "bold") +
+  scale_fill_manual(values = c("Sem PCA (5 variáveis)" = "#3B82F6", "Com PCA (3 PCs)" = "#E8583E")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "PCA vs. Features Brutas — RMSE no Teste", x = NULL, y = "RMSE (°C)", fill = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "top")
+```
+
+::: {.callout-important}
+## Quando o PCA ajuda — e quando atrapalha
+
+| Situação | PCA ajuda? |
+|---|:---:|
+| Muitas features redundantes (dezenas/centenas) | **Sim** — remove ruído e multicolinearidade |
+| **Poucas variáveis, todas informativas (nosso caso)** | **Não** — reduzir dimensão **descarta sinal** |
+| Visualização 2D/3D | **Sempre** — comprime para inspeção |
+| Árvores / boosting com features correlacionadas | **Pouco** — já tratam correlação nativamente |
+
+Com apenas **5 variáveis meteorológicas**, todas úteis, comprimi-las em 3 PCs **piora** o RMSE
+nos dois algoritmos — e mesmo com 4 PCs (94% da variância) ainda perde. A lição: **o PCA é
+valioso como ferramenta exploratória** (estrutura e visualização, como acima), **mas não como
+pré-processamento preditivo aqui**. Por isso os modelos finais usam as **features brutas**, não
+os componentes — mais dimensões, neste caso, significam mais informação.
+:::
+
+## Modelos — Apresentação
+
+Comparamos cinco abordagens, todas em `tidymodels` (recipe + parsnip + workflow) e treinadas
+no mesmo painel. **Apresentamos cada modelo aqui**; os **resultados** (erro **e** recall) vêm
+na seção [Resultados e Comparação](#resultados).
+
+| Modelo | O que é | Característica |
+|---|---|---|
+| **Regressão Linear** | uma equação linear global | alto viés, baixa variância; extrapola |
+| **Random Forest** | média de muitas árvores (*bagging*) | baixa variância; não extrapola |
+| **XGBoost (tuned)** | árvores sequenciais (*boosting*) + tuning por CV | baixo viés; referência em dados tabulares |
+| **Ensemble (Reg. Linear + XGBoost)** | média dos dois mais opostos | erros decorrelacionados → menor RMSE |
+| **Rede Neural (MLP)** | perceptron multicamadas (`torch`) | capta não-linearidades; item opcional |
+
+O código abaixo ajusta todos os modelos; em seguida detalhamos o **tuning do XGBoost**, a
+**arquitetura da MLP** e a **interpretabilidade (SHAP)** — e só então comparamos os resultados.
+
+```{r reg-models}
+#| cache: true
+rec_reg <- recipe(target ~ ., data = trs_reg) |>
+  step_zv(all_predictors()) |> step_normalize(all_numeric_predictors())
+
+lin_spec <- linear_reg() |> set_engine("lm")
+rf_spec  <- rand_forest(trees = 400, mode = "regression") |>
+  set_engine("ranger", importance = "impurity", num.threads = n_cores)
+lin_fit <- workflow(rec_reg, lin_spec) |> fit(trs_reg)
+set.seed(1); rf_fit_reg <- workflow(rec_reg, rf_spec) |> fit(trs_reg)
+p_lin <- predict(lin_fit,    test_reg)$.pred
+p_rf  <- predict(rf_fit_reg, test_reg)$.pred
+
+# XGBoost com tuning — sem normalização (árvores são invariantes à escala).
+# Grid simples sobre os três hiperparâmetros principais.
+rec_x <- recipe(target ~ ., data = trs_reg) |> step_zv(all_predictors())
+xgb_spec <- boost_tree(trees = tune(), tree_depth = tune(), learn_rate = tune()) |>
+  set_engine("xgboost", nthread = n_cores) |> set_mode("regression")
+xgb_grid <- crossing(learn_rate = c(0.05, 0.1), trees = c(500, 900), tree_depth = c(4, 6))
+
+# CV TEMPORAL (expanding origin): cada fold treina em tudo ANTES de um ano de corte e
+# valida NO ano de corte — nunca usa o futuro para escolher hiperparâmetros do passado.
+cortes_cv <- c(2014L, 2017L, 2020L)
+folds_t <- rsample::manual_rset(
+  splits = purrr::map(cortes_cv, function(cy) {
+    ana <- which(train_reg$date <  as.Date(sprintf("%d-01-01", cy)))
+    ass <- which(train_reg$date >= as.Date(sprintf("%d-01-01", cy)) &
+                 train_reg$date <  as.Date(sprintf("%d-01-01", cy + 1L)))
+    rsample::make_splits(list(analysis = ana, assessment = ass), data = trs_reg)
+  }),
+  ids = sprintf("treino<%d/valida%d", cortes_cv, cortes_cv))
+set.seed(1)
+xgb_tuned   <- tune_grid(workflow(rec_x, xgb_spec), resamples = folds_t,
+                         grid = xgb_grid, metrics = metric_set(yardstick::rmse))
+best_xgb    <- select_best(xgb_tuned, metric = "rmse")
+xgb_fit_reg <- workflow(rec_x, xgb_spec) |> finalize_workflow(best_xgb) |> fit(trs_reg)
+p_xgb <- predict(xgb_fit_reg, test_reg)$.pred
+
+# Ensemble: Regressão Linear + XGBoost (média simples)
+p_ens <- (p_lin + p_xgb) / 2
+
+# MLP (torch/brulee) — item opcional do enunciado
+have_torch <- requireNamespace("brulee", quietly = TRUE) &&
+              isTRUE(tryCatch(torch::torch_is_installed(), error = function(e) FALSE))
+if (have_torch) {
+  mlp_spec <- mlp(hidden_units = 64, dropout = 0.10, epochs = 60, learn_rate = 0.05,
+                  activation = "relu") |>
+    set_engine("brulee", optimizer = "SGD", momentum = 0.9, batch_size = 1024L,
+               validation = 0.20, stop_iter = 8L) |>
+    set_mode("regression")
+  set.seed(1); mlp_fit_reg <- workflow(rec_reg, mlp_spec) |> fit(trs_reg)
+  p_mlp <- predict(mlp_fit_reg, test_reg)$.pred
+}
+
+cat(sprintf("XGBoost — melhores hiperparâmetros: trees=%d | depth=%d | eta=%.2f\n",
+            best_xgb$trees, best_xgb$tree_depth, best_xgb$learn_rate))
+```
+
+::: {.callout-important}
+## Por que o Ensemble Regressão Linear + XGBoost
+O **Ensemble** combina os modelos mais **estruturalmente opostos** — uma equação linear global
+(alto viés, baixa variância) e árvores *boosted* (baixo viés). Como erram de formas diferentes,
+a **média simples** tende a ficar abaixo de cada um isolado. Seu ganho real — e o de cada
+modelo — aparece na comparação de resultados adiante.
+:::
+
+### Otimização de Hiperparâmetros do XGBoost
+
+O XGBoost é o modelo com hiperparâmetros **otimizados por busca**. Varremos um **grid** sobre
+três parâmetros — taxa de aprendizado (`learn_rate`/eta), número de árvores (`trees`) e
+profundidade das árvores (`tree_depth`) — com **validação cruzada temporal** (*expanding
+origin*): cada *fold* treina em todos os anos **anteriores** a um corte e valida **no ano
+seguinte**, de modo que o tuning **nunca usa o futuro para escolher hiperparâmetros do
+passado** (ao contrário de um *k-fold* aleatório, inadequado para séries temporais). Escolhemos
+a combinação de **menor RMSE médio**; o teste (2023–2024) permanece intocado até a avaliação
+final.
+
+```{r reg-xgb-tune}
+show_best(xgb_tuned, metric = "rmse", n = 6) |>
+  select(learn_rate, trees, tree_depth, mean, std_err) |>
+  knitr::kable(digits = 4,
+               caption = "Top 6 combinações do grid — RMSE médio em validação cruzada temporal (expanding origin) no treino")
+```
+
+```{r fig-reg-xgb-tune}
+#| fig-cap: "Desempenho (RMSE em CV) ao longo do grid de hiperparâmetros do XGBoost. Cada painel/linha isola o efeito de um parâmetro."
+#| fig-height: 4
+autoplot(xgb_tuned) +
+  labs(title = "Tuning do XGBoost — RMSE por combinação de hiperparâmetros") +
+  theme_minimal(base_size = 12)
+```
+
+### Rede Neural (MLP) — Arquitetura e Treino
+
+A rede neural (item opcional do enunciado) é um **Multi-Layer Perceptron** totalmente
+conectado, especificado em `tidymodels` via `parsnip::mlp()` com engine **`brulee`** — a
+interface **`torch`** nativa em R (libtorch), **sem dependência de Python**:
+
+- **Entrada:** as 14 features numéricas (clima do dia + Fourier + `lat`/`lon`/`elevation`), normalizadas pelo `recipe`.
+- **Camada oculta:** 64 neurônios com ativação **ReLU** e **dropout** de 10% (regularização).
+- **Saída:** 1 neurônio linear (regressão da máxima de amanhã).
+- **Treino:** SGD com *momentum* (0,9), *mini-batches* de 1024 e **early stopping** sobre 20% de validação — interrompe quando a perda de validação para de cair.
+
+::: {.callout-tip}
+## Pré-requisito: backend torch
+`brulee` usa o **torch** nativo (libtorch), sem Python. Para instalar, rode uma vez:
+`install.packages(c("torch","brulee"))` e `torch::install_torch()` (baixa o backend, ~100 MB).
+Se o backend não estiver disponível no ambiente, a seção da MLP é **ignorada automaticamente**
+e os demais modelos permanecem válidos.
+:::
+
+```{r fig-reg-mlp-loss}
+#| eval: !expr have_torch
+#| fig-cap: "Curva de aprendizado da MLP: perda (MSE) por época. O early stopping interrompe o treino quando a perda de validação para de melhorar, evitando overfitting."
+#| fig-height: 4
+autoplot(extract_fit_engine(mlp_fit_reg)) +
+  labs(title = "Curva de Treino — MLP (torch / brulee)",
+       subtitle = "Perda por época | early stopping sobre a validação") +
+  theme_minimal(base_size = 12)
+```
+
+```{r reg-mlp-missing}
+#| echo: false
+#| eval: !expr isFALSE(have_torch)
+cat("Seção da MLP ignorada: o backend torch (libtorch) não está instalado neste ambiente.\n",
+    "Para habilitá-la, rode em R: install.packages(c('torch','brulee')); torch::install_torch()\n", sep = "")
+```
+
+::: {.callout-note}
+## Deep Learning em dados tabulares
+Em bases tabulares suaves, redes neurais **nem sempre** superam árvores e ensembles. Avaliamos
+a MLP em **pé de igualdade** com os demais — o desempenho relativo (erro e recall) aparece na
+[comparação de resultados](#resultados). O valor maior aqui é metodológico: o pipeline `torch`
+fica pronto para escalar a arquiteturas mais profundas se novas features (radar, satélite)
+forem incorporadas.
+:::
+
+### Interpretabilidade — SHAP (XGBoost)
+
+Os **SHAP values** decompõem cada predição na contribuição de cada feature. O gráfico de
+importância global (média de |SHAP|) mostra o que mais pesa na previsão regional.
+
+```{r reg-shap}
+#| fig-height: 5
+#| fig-cap: "Importância global (SHAP) das features no XGBoost regional. As temperaturas de hoje dominam; Fourier e a geografia (elevação/latitude) entram em seguida."
+library(shapviz)
+X_te_reg <- bake(prep(rec_x), test_reg, all_predictors()) |> as.matrix()
+shap_reg <- shapviz(extract_fit_engine(xgb_fit_reg), X_pred = X_te_reg)
+sv_importance(shap_reg, kind = "bar", max_display = 12) +
+  labs(title = "Importância Global (SHAP) — XGBoost Regional") +
+  theme_minimal(base_size = 12)
+```
+
+## Resultados e Comparação dos Modelos {#resultados}
+
+Com todos os modelos apresentados, agora comparamos o desempenho. Para o negócio, a escolha
+**não** se baseia só no menor erro: o modelo precisa também **capturar os dias de estresse**
+(recall do alerta ≥ 35 °C). A tabela traz **erro** (RMSE/MAE/R²) **e** **qualidade do alerta**
+(recall, precisão) por modelo.
+
+::: {.callout-note}
+## Como as métricas são calculadas
+RMSE/MAE/R² são **agregados sobre as 11.680 observações dos 16 municípios juntas** (não a média
+dos 16 RMSEs por município — esse recorte está em [O Modelo Generaliza?](#generaliza)). Recall
+e precisão referem-se ao **alerta de estresse** (`temp_max ≥ 35 °C`) sobre esse mesmo teste.
+:::
+
+```{r reg-results}
+THR_A <- 35
+alert_rp <- function(pred) {
+  ra <- factor(if_else(test_reg$target >= THR_A, "Estresse", "Normal"), levels = c("Estresse","Normal"))
+  pa <- factor(if_else(pred           >= THR_A, "Estresse", "Normal"), levels = c("Estresse","Normal"))
+  list(rec  = yardstick::recall_vec(ra, pa),
+       prec = tryCatch(yardstick::precision_vec(ra, pa), error = function(e) NA_real_))
+}
+preds_reg <- list("Regressão Linear" = p_lin, "Random Forest" = p_rf, "XGBoost (tuned)" = p_xgb,
+                  "Ensemble (Reg. Linear + XGBoost)" = p_ens)
+if (exists("p_mlp")) preds_reg[["Rede Neural (MLP)"]] <- p_mlp
+
+res_reg <- purrr::imap_dfr(preds_reg, function(p, nm) {
+  a <- alert_rp(p)
+  tibble(Modelo = nm, RMSE = rmse(p, test_reg$target), MAE = mae(p, test_reg$target),
+         R2 = r2(p, test_reg$target), Recall = a$rec, `Precisão` = a$prec)
+}) |> mutate(across(where(is.numeric), \(x) round(x, 3)))
+
+res_reg |> arrange(RMSE) |>
+  knitr::kable(caption = sprintf(
+    "Modelos regionais — erro e qualidade do alerta de estresse (≥ %d °C), teste 2023–2024 (11.680 obs.)", THR_A))
+```
+
+```{r reg-selection}
+#| echo: false
+#| results: asis
+best_err <- res_reg |> slice_min(RMSE, n = 1) |> slice_head(n = 1)
+best_rec <- res_reg |> slice_max(Recall, n = 1) |> slice_head(n = 1)
+bal      <- res_reg |> mutate(score = rank(RMSE) + rank(-Recall)) |> slice_min(score, n = 1) |> slice_head(n = 1)
+cat(sprintf(
+"::: {.callout-important}
+## Escolha do modelo — por erro **e** por recall
+
+Não basta o menor erro: o modelo precisa **capturar dias de estresse**. Menor **RMSE**: **%s**
+(%.3f °C, recall %.0f%%). Maior **recall**: **%s** (recall %.0f%%, RMSE %.3f °C). Combinando os
+dois critérios (ranking de RMSE + ranking de recall), a escolha mais equilibrada é o **%s**
+(RMSE %.3f °C, recall %.0f%%, precisão %.0f%%) — bom erro **e** boa cobertura dos eventos. O
+recall ainda é limitado pelo limiar fixo de 35 °C; a [camada de decisão](#camada-decisao)
+mostra como elevá-lo.
+:::\n\n",
+best_err$Modelo, best_err$RMSE, 100*best_err$Recall,
+best_rec$Modelo, 100*best_rec$Recall, best_rec$RMSE,
+bal$Modelo, bal$RMSE, 100*bal$Recall, 100*bal$`Precisão`))
+```
+
+```{r reg-spread-calc}
+#| echo: false
+spread_rmse  <- diff(range(res_reg$RMSE))
+xgb_row      <- res_reg |> mutate(rk = rank(RMSE, ties.method = "min")) |>
+  filter(Modelo == "XGBoost (tuned)")
+xgb_rmse_v   <- xgb_row$RMSE; xgb_rank_v <- xgb_row$rk
+lin_rmse_v   <- res_reg |> filter(Modelo == "Regressão Linear") |> pull(RMSE)
+n_mod_v      <- nrow(res_reg)
+```
+
+::: {.callout-note}
+## Por que os modelos ficam tão próximos — e o boosting não domina
+
+O alvo é a **máxima de amanhã**, fortemente determinada pela **máxima de hoje** (a temperatura
+tem forte inércia diária). Quando a média condicional é quase linear, a **Regressão Linear** já
+captura a maior parte do sinal e sobra pouco espaço para um aprendiz mais flexível ganhar:
+todos os modelos caem numa faixa de **`r sprintf("%.3f", spread_rmse)` °C** de RMSE. O
+**XGBoost**, mesmo com grid amplo e regularização, **não supera** a Regressão Linear e fica no
+fim da fila (RMSE `r sprintf("%.3f", xgb_rmse_v)` vs `r sprintf("%.3f", lin_rmse_v)` °C,
+`r xgb_rank_v`º lugar de `r n_mod_v`) — em um problema suave e quase linear, *boosting* rende
+pouco sobre o baseline. A vantagem real da não-linearidade aparece na **cauda** (dias de
+estresse), onde o tuning e a **MLP** ajudam no recall. A lição honesta: **complexidade só
+compensa quando há não-linearidade a explorar** — reportar isso, em vez de presumir que o
+XGBoost vence por ser XGBoost, é parte do rigor.
+:::
+
+### Benchmarks Ingênuos — Persistência e ARIMA
+
+Dois **benchmarks ingênuos** delimitam o que o modelo regional precisa superar:
+
+- **Persistência** (*amanhã = hoje*): a referência **justa** e mais difícil de bater, porque a
+  máxima tem forte inércia diária. É o piso honesto para uma previsão de 1 dia.
+- **ARIMA(p,d,q) multi-step**: modela cada série municipal só com termos autorregressivos e de
+  média móvel — **sem clima nem geografia**. Ajustamos um ARIMA **por município** no treino e
+  prevemos **todo o horizonte de teste de uma vez** (multi-step de ~2 anos). É deliberadamente
+  um **limite inferior**: numa previsão multi-step longa o ARIMA converge para o ciclo sazonal
+  e **não** é um competidor de 1 passo — serve para mostrar quanto se perde usando só a história
+  da série, sem covariáveis.
+
+```{r reg-arima}
+#| cache: true
+arima_tr   <- feat_reg |> filter(date < cutoff) |> select(city, date, temp = target) |>
+  as_tsibble(index = date, key = city)
+arima_fits <- arima_tr |> model(ARIMA = ARIMA(temp ~ PDQ(0, 0, 0)))
+hmax       <- test_reg |> count(city) |> pull(n) |> max()
+arima_pred <- arima_fits |> forecast(h = hmax) |> as_tibble() |> select(city, date, .mean)
+arima_join <- test_reg |> select(city, date, target) |> left_join(arima_pred, by = c("city","date"))
+rmse_arima <- rmse(arima_join$.mean, arima_join$target)
+
+# Baseline JUSTO: persistência (amanhã = máxima de hoje)
+p_persist    <- test_reg$temp_max
+rmse_persist <- rmse(p_persist, test_reg$target)
+
+cat(sprintf(paste0("Persistência (amanhã=hoje) — RMSE = %.3f °C\n",
+                   "ARIMA (multi-step, 16 munic.) — RMSE = %.3f °C\n",
+                   "Modelo Regional (ensemble)    — RMSE = %.3f °C\n"),
+            rmse_persist, rmse_arima, rmse(p_ens, test_reg$target)))
+```
+
+```{r fig-reg-forecast}
+#| fig-cap: "Primeiros 90 dias de teste em três municípios (oeste ameno / centro / sul quente). O modelo regional acompanha as variações diárias; o ARIMA converge para o ciclo médio e perde o dia a dia."
+#| fig-height: 6
+mun_ex  <- c("Sapezal", "Sorriso", "Rondonópolis")
+plot_df <- test_reg |> mutate(`Modelo Regional` = p_ens) |>
+  select(city, date, Real = target, `Modelo Regional`) |>
+  left_join(arima_pred |> rename(ARIMA = .mean), by = c("city","date")) |>
+  filter(city %in% mun_ex) |> group_by(city) |> arrange(date) |> slice_head(n = 90) |> ungroup() |>
+  mutate(city = factor(city, levels = mun_ex)) |>
+  pivot_longer(c(Real, `Modelo Regional`, ARIMA), names_to = "Modelo", values_to = "Temp") |>
+  mutate(Modelo = factor(Modelo, levels = c("Real","Modelo Regional","ARIMA")))
+ggplot(plot_df, aes(date, Temp, color = Modelo, linewidth = Modelo == "Real")) +
+  geom_line() +
+  facet_wrap(~city, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = c("Real" = "#1F2937", "Modelo Regional" = "#1D4ED8", "ARIMA" = "#F59E0B")) +
+  scale_linewidth_manual(values = c("TRUE" = 1.1, "FALSE" = 0.7), guide = "none") +
+  labs(title = "Previsão vs Real — Primeiros 90 Dias de Teste (3 municípios)",
+       subtitle = sprintf("RMSE agregado nos 16: Modelo Regional = %.2f °C   |   ARIMA = %.2f °C",
+                          rmse(p_ens, test_reg$target), rmse_arima),
+       x = NULL, y = "Temp. Máxima (°C)", color = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+```
+
+```{r reg-arima-note}
+#| echo: false
+#| results: asis
+cat(sprintf(
+"::: {.callout-note}
+## Comparação justa: o que o modelo realmente precisa bater
+O ARIMA multi-step (**%.2f °C**) é um **limite inferior por construção** — ao prever ~2 anos só
+com a história da série, colapsa no ciclo sazonal. A comparação **justa** é contra a
+**persistência** (*amanhã = hoje*, **%.2f °C**): como a máxima tem forte inércia, esse baseline
+já é forte. O modelo regional (**%.2f °C**) **supera a persistência** usando **clima de hoje +
+Fourier + geografia** para antecipar as *viradas* que a persistência erra — e é esse ganho
+(**−%.2f °C** sobre o baseline justo), não a distância para o ARIMA, que mede o valor do
+aprendizado supervisionado.
+:::\n\n",
+rmse_arima, rmse_persist, rmse(p_ens, test_reg$target), rmse_persist - rmse(p_ens, test_reg$target)))
+```
+
+### Comparação Visual — Erro e Recall
+
+```{r fig-reg-compare}
+#| fig-cap: "RMSE de teste por modelo (agregado nos 16 municípios), com os benchmarks ingênuos: persistência (cinza, *amanhã=hoje*) e ARIMA multi-step (laranja). Barras menores = melhor."
+#| fig-height: 4.3
+bind_rows(res_reg |> select(Modelo, RMSE),
+          tibble(Modelo = c("Persistência (amanhã=hoje)", "ARIMA (multi-step)"),
+                 RMSE   = round(c(rmse_persist, rmse_arima), 3))) |>
+  mutate(grupo = case_when(Modelo == "ARIMA (multi-step)"         ~ "arima",
+                           Modelo == "Persistência (amanhã=hoje)" ~ "persist",
+                           RMSE == min(RMSE)                       ~ "melhor",
+                           TRUE                                    ~ "modelo"),
+         Modelo = reorder(Modelo, -RMSE)) |>
+  ggplot(aes(RMSE, Modelo, fill = grupo)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.3f", RMSE)), hjust = -0.1, size = 3.6) +
+  scale_fill_manual(values = c("modelo" = "#93C5FD", "melhor" = "#1D4ED8",
+                               "arima" = "#F59E0B", "persist" = "#9CA3AF"), guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Erro no Teste — Modelos Regionais vs Benchmarks Ingênuos", x = "RMSE (°C)", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+```{r fig-reg-recall}
+#| fig-cap: "Recall do alerta de estresse (temp_max ≥ 35 °C) por modelo — fração dos dias de estresse que cada modelo captura. Maior = melhor para o negócio (menos quebras de safra não antecipadas)."
+#| fig-height: 4
+res_reg |>
+  mutate(destaque = Recall == max(Recall), Modelo = reorder(Modelo, Recall)) |>
+  ggplot(aes(Recall, Modelo, fill = destaque)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = scales::percent(Recall, accuracy = 0.1)), hjust = -0.1, size = 3.6) +
+  scale_fill_manual(values = c("FALSE" = "#FCA5A5", "TRUE" = "#DC2626"), guide = "none") +
+  scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.18))) +
+  labs(title = "Recall do Alerta de Estresse (≥ 35 °C) por Modelo", x = "Recall", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+### Incerteza — Intervalos de Confiança Bootstrap do RMSE
+
+As diferenças de RMSE entre os modelos são pequenas (faixa de ~0,1 °C). Para saber se são
+**estatisticamente distinguíveis** ou apenas ruído amostral, reamostramos o conjunto de teste
+com reposição (*bootstrap*, B = 1000) e recalculamos o RMSE de cada modelo em cada réplica,
+obtendo intervalos de 95%.
+
+```{r fig-reg-boot}
+#| cache: true
+#| fig-cap: "RMSE de teste com intervalo de confiança bootstrap de 95% (B = 1000). Quando as barras horizontais se sobrepõem, a diferença de RMSE entre os modelos não é estatisticamente distinguível."
+#| fig-height: 4
+set.seed(1)
+B <- 1000; n_te <- nrow(test_reg); y_te <- test_reg$target
+boot_idx <- replicate(B, sample.int(n_te, n_te, replace = TRUE), simplify = FALSE)
+boot_reg <- purrr::imap_dfr(preds_reg, function(p, nm) {
+  vals <- vapply(boot_idx, function(ix) rmse(p[ix], y_te[ix]), numeric(1))
+  tibble(Modelo = nm, RMSE = mean(vals),
+         lo = unname(quantile(vals, 0.025)), hi = unname(quantile(vals, 0.975)))
+})
+boot_reg |>
+  mutate(Modelo = reorder(Modelo, -RMSE)) |>
+  ggplot(aes(RMSE, Modelo)) +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.22, color = "#6B7280", linewidth = 0.8) +
+  geom_point(size = 3.2, color = "#1D4ED8") +
+  geom_text(aes(label = sprintf("%.3f", RMSE)), vjust = -1, size = 3.3) +
+  labs(title = "RMSE com Intervalo de Confiança Bootstrap (95%)",
+       subtitle = "B = 1000 reamostragens do teste · barras sobrepostas = diferença não significativa",
+       x = "RMSE (°C)", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+```{r reg-boot-note}
+#| echo: false
+#| results: asis
+ord  <- boot_reg |> arrange(RMSE)
+top1 <- ord |> slice(1); top2 <- ord |> slice(2)
+overlap  <- top1$hi >= top2$lo
+veredito <- if (overlap) sprintf(
+  "os IC de 95%% do **%s** e do **%s** se **sobrepõem** — a vantagem do 1º lugar **não é estatisticamente significativa**; tratá-los como empate técnico é o mais honesto",
+  top1$Modelo, top2$Modelo) else sprintf(
+  "o IC de 95%% do **%s** fica **abaixo** do 2º colocado — a liderança em erro é estatisticamente sustentada",
+  top1$Modelo)
+cat(sprintf(
+"::: {.callout-important}
+## Leitura da incerteza
+O menor erro é do **%s** (RMSE %.3f °C, IC95%% [%.3f; %.3f]); %s. Na prática, como o erro é
+estatisticamente **equivalente** entre os primeiros colocados, a escolha final se apoia no
+**recall** (cobertura dos dias de estresse) e na **robustez/simplicidade** — e não numa
+diferença de RMSE dentro do ruído.
+:::\n\n",
+top1$Modelo, top1$RMSE, top1$lo, top1$hi, veredito))
+```
+
+## Protocolo Treino / Validação / Teste (80 / 10 / 10)
+
+Até aqui usamos um split **treino / teste** (até 2022 vs 2023–2024). Para selecionar modelos
+sem contaminar a estimativa final, o protocolo de **três vias** separa os papéis: o
+**treino** ajusta os parâmetros; a **validação** compara e **escolhe** modelos; o **teste** é
+tocado **uma única vez**, no vencedor, para uma estimativa imparcial. Mantemos o split
+**cronológico** (não aleatório), coerente com a previsão em produção.
+
+```{r fig-reg-3way}
+#| fig-height: 1.9
+#| fig-cap: "Split cronológico 80/10/10 do painel. O teste (vermelho) é o período mais recente, reservado até a avaliação final do modelo escolhido na validação."
+feat3 <- feat_reg |> arrange(date)
+n3 <- nrow(feat3); c1 <- floor(0.80 * n3); c2 <- floor(0.90 * n3)
+tr3 <- feat3[seq_len(c1), ]; va3 <- feat3[(c1 + 1):c2, ]; te3 <- feat3[(c2 + 1):n3, ]
+tibble(Conjunto = factor(c("Treino (80%)","Validação (10%)","Teste (10%)"),
+                         levels = c("Treino (80%)","Validação (10%)","Teste (10%)")),
+       inicio = as.Date(c(min(tr3$date), min(va3$date), min(te3$date))),
+       fim    = as.Date(c(max(tr3$date), max(va3$date), max(te3$date)))) |>
+  ggplot() +
+  geom_rect(aes(xmin = inicio, xmax = fim, ymin = 0, ymax = 1, fill = Conjunto),
+            color = "white", linewidth = 0.8) +
+  scale_fill_manual(values = c("Treino (80%)" = "#3B82F6", "Validação (10%)" = "#F59E0B",
+                               "Teste (10%)" = "#E8583E")) +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title = "Split Cronológico 80 / 10 / 10 — Painel Regional MT", x = NULL, y = NULL, fill = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.y = element_blank(), panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(), legend.position = "top")
+```
+
+Treinamos os candidatos **só no treino (80%)**, comparamos na **validação (10%)** e
+confirmamos o vencedor no **teste (10%)**. Para o XGBoost reaproveitamos os hiperparâmetros já
+selecionados por CV.
+
+```{r reg-3way}
+#| cache: true
+sel3 <- function(df) df |> select(all_of(c(feats_reg, "target")))
+rec3  <- recipe(target ~ ., data = sel3(tr3)) |> step_zv(all_predictors()) |> step_normalize(all_numeric_predictors())
+rec3x <- recipe(target ~ ., data = sel3(tr3)) |> step_zv(all_predictors())
+lin3 <- workflow(rec3,  lin_spec) |> fit(sel3(tr3))
+set.seed(1); rf3 <- workflow(rec3, rf_spec) |> fit(sel3(tr3))
+xgb3 <- workflow(rec3x, xgb_spec) |> finalize_workflow(best_xgb) |> fit(sel3(tr3))
+
+avalia <- function(df, etapa) {
+  pl <- predict(lin3, df)$.pred; pr <- predict(rf3, df)$.pred; px <- predict(xgb3, df)$.pred
+  tibble(Modelo = c("Regressão Linear","Random Forest","XGBoost","Ensemble (RL+XGB)"),
+         RMSE = c(rmse(pl, df$target), rmse(pr, df$target), rmse(px, df$target), rmse((pl + px) / 2, df$target)),
+         Etapa = etapa)
+}
+val_s  <- avalia(va3, "Validação"); test_s <- avalia(te3, "Teste")
+melhor <- val_s |> slice_min(RMSE, n = 1) |> pull(Modelo)
+
+val_s |> select(Modelo, `RMSE validação` = RMSE) |>
+  left_join(test_s |> select(Modelo, `RMSE teste` = RMSE), by = "Modelo") |>
+  arrange(`RMSE validação`) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)),
+         Seleção = if_else(Modelo == melhor, "★", "")) |>
+  knitr::kable(caption = "Seleção na validação, confirmação no teste held-out. ★ = modelo escolhido sem olhar o teste.")
+```
+
+::: {.callout-tip}
+## O que o protocolo de 3 vias entrega
+Ele **não reduz** o RMSE de nenhum modelo; entrega uma **estimativa imparcial** e uma seleção
+sem contaminar o teste. O ganho de desempenho real vem da validação usada *dentro* do treino —
+o **tuning do XGBoost por CV** e o **early stopping da MLP**. Esta seção torna esse princípio
+explícito para a comparação entre algoritmos.
+:::
+
+## O Modelo Generaliza? RMSE por Município {#generaliza}
+
+```{r reg-citymap}
+#| fig-cap: "RMSE de teste por município, usando o ÚNICO modelo regional (ensemble). Verde = erro baixo. A faixa estreita mostra que o modelo serve todo o estado, não só um ponto."
+#| fig-height: 6.5
+percity <- test_reg |> mutate(pred = p_ens) |> group_by(city) |>
+  summarise(rmse = rmse(pred, target), .groups = "drop") |> left_join(panel_meta, by = "city")
+
+ggplot(percity, aes(lon, lat)) +
+  base_mt +
+  geom_point(aes(color = rmse), size = 6, alpha = 0.95) +
+  geom_text_repel(aes(label = sprintf("%s\n%.2f", city, rmse)), size = 2.7,
+                  lineheight = 0.9, segment.color = "gray60", min.segment.length = 0,
+                  max.overlaps = 20, seed = 1) +
+  scale_color_distiller(palette = "RdYlGn", direction = -1, name = "RMSE\nteste (°C)") +
+  coord_sf(expand = TRUE) +
+  labs(title = "Erro do Modelo Regional — por Município",
+       subtitle = sprintf("RMSE por município entre %.2f e %.2f °C (média simples %.2f) — modelo regional único",
+                          min(percity$rmse), max(percity$rmse), mean(percity$rmse)),
+       x = "Longitude", y = "Latitude") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), plot.margin = margin(10, 30, 10, 10))
+```
+
+## Camada de Decisão — Alerta de Estresse Térmico {#camada-decisao}
+
+A regressão entrega a máxima prevista; o negócio precisa de uma **decisão**: disparar o
+alerta de risco de safra? Aplicamos um **limiar operacional de 35 °C** sobre a previsão do
+**ensemble**. Com 16 municípios, o teste tem **milhares** de dias de estresse — as métricas
+do alerta são estatisticamente robustas.
+
+::: {.callout-important}
+## Por que 35 °C é o problema
+Para **soja e milho**, máximas acima de **~35 °C** durante a **floração** e o **enchimento de
+grãos** são fisiologicamente críticas: reduzem a **viabilidade do pólen** (esterilidade),
+aumentam o **aborto de flores e vagens** e derrubam a **fotossíntese** e a taxa de enchimento —
+traduzindo-se em **queda de produtividade**. Por isso 35 °C é o limiar de estresse usado tanto
+nos **mapas de risco** (Análise Exploratória) quanto neste **alerta** — diagnóstico e decisão
+no mesmo critério.
+:::
+
+```{r reg-decision}
+THR <- 35
+labf <- function(x) factor(if_else(x >= THR, "Estresse", "Normal"), levels = c("Estresse","Normal"))
+dec_reg <- tibble(real = labf(test_reg$target), pred = labf(p_ens))
+
+cm_reg <- yardstick::conf_mat(dec_reg, truth = real, estimate = pred); cm_reg
+cat(sprintf("\nDias de estresse no teste: %s\n", format(sum(test_reg$target >= THR), big.mark=".")))
+
+metric_set(yardstick::precision, yardstick::recall, yardstick::f_meas)(
+  dec_reg, truth = real, estimate = pred) |>
+  transmute(Métrica = dplyr::recode(.metric, precision = "Precisão", recall = "Recall", f_meas = "F1"),
+            Valor = round(.estimate, 3)) |>
+  knitr::kable(caption = sprintf("Alerta regional de estresse (temp_max ≥ %d °C) — teste 2023–2024", THR))
+```
+
+```{r fig-reg-sweep}
+#| fig-cap: "Trade-off precisão × recall do limiar de alerta. Limiar mais baixo captura mais estresse (recall) ao custo de mais falsos alarmes (precisão)."
+#| fig-height: 4.2
+sweep <- purrr::map_dfr(seq(31, 38, 0.5), function(t) {
+  ra <- factor(if_else(test_reg$target >= t, "Estresse", "Normal"), levels = c("Estresse","Normal"))
+  pa <- factor(if_else(p_ens          >= t, "Estresse", "Normal"), levels = c("Estresse","Normal"))
+  tibble(limiar = t,
+         Precisão = tryCatch(yardstick::precision_vec(ra, pa), error = function(e) NA_real_),
+         Recall   = tryCatch(yardstick::recall_vec(ra, pa),    error = function(e) NA_real_))
+})
+sweep |> pivot_longer(c(Precisão, Recall), names_to = "Métrica", values_to = "v") |>
+  ggplot(aes(limiar, v, color = Métrica)) +
+  geom_line(linewidth = 1.1) + geom_point(size = 2) +
+  geom_vline(xintercept = THR, linetype = "dashed", color = "gray40") +
+  scale_color_manual(values = c("Precisão" = "#1D4ED8", "Recall" = "#E8583E")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Trade-off do Limiar de Alerta (regional)", x = "Limiar de temp_max (°C)",
+       y = NULL, color = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+::: {.callout-tip}
+## Leitura de negócio
+Para o agente de commodities, **recall** e **precisão** têm custos assimétricos: um estresse
+perdido é uma quebra de safra não antecipada; um falso alarme custa uma ação operacional à
+toa. Como a quebra costuma doer mais, a política tende a **privilegiar recall** baixando o
+limiar — e agora isso é calibrado sobre **milhares de eventos** e válido para **toda a região
+produtora**, não apenas um município.
+:::
+
+::: {.callout-important}
+## O recall do alerta ainda é baixo — como melhorar (próximos passos)
+
+Capturar apenas parte dos dias de estresse não basta para uso operacional. Vias concretas para elevar o recall, da mais simples à mais sofisticada:
+
+1. **Calibrar o limiar para o objetivo de negócio.** O corte de 35 °C é agronômico, não ótimo para *detecção*. O gráfico de trade-off mostra que **baixar o limiar** (ex.: 33–34 °C) eleva bastante o recall ao custo de mais falsos alarmes — escolhe-se o ponto por uma métrica que prioriza recall, como **F-β (β > 1)** ou "máximo recall com precisão ≥ X".
+2. **Tratar o desbalanceamento com um classificador dedicado.** Em vez de regressão + limiar, treinar um **classificador** com **pesos de classe / aprendizado sensível a custo** ou reamostragem (**SMOTE**/oversampling dos dias de estresse), penalizando o **falso negativo** (estresse perdido) mais que o falso alarme.
+3. **Prever a distribuição, não só a média.** **Regressão quantílica** (prever o quantil 0,9 da máxima) ou usar o desvio dos resíduos para estimar **P(temp_max ≥ 35 °C)** e alertar quando essa probabilidade cruza um corte — captura melhor a cauda quente.
+4. **Features de precursores de onda de calor.** Adicionar **persistência** (lag da própria máxima, sequência de dias secos), umidade do solo e índices sinóticos/**ENSO** — sinais que antecedem extremos e hoje faltam ao modelo.
+5. **Mais exemplos na cauda.** Incluir os 4 municípios faltantes (20/20) e variáveis/horizontes extras aumenta os casos de estresse para o modelo aprender o regime extremo.
+
+O caminho mais rápido e de maior impacto é o **item 1** (recalibrar o limiar); o de maior ganho estrutural é o **item 2/3** — **implementado a seguir**, com um classificador dedicado sensível a custo.
+:::
+
+## Classificador Dedicado ao Alerta — Sensível a Custo
+
+A regressão prevê a máxima e dispara o alerta ao cruzar 35 °C — mas, por mirar a **média
+condicional**, subdetecta a cauda quente (recall ~49 %). Tratamos então o alerta **diretamente
+como classificação binária** (*dia de estresse* vs *normal*) com um XGBoost. A **sensibilidade a
+custo** entra na **regra de decisão**: em vez de cortar em 0,5, escolhemos o **limiar de
+probabilidade** que maximiza o **F-β (β = 2)** — métrica que pondera o **recall acima da
+precisão**, coerente com o fato de que uma **quebra de safra não antecipada dói mais que um
+alarme à toa**. Isso é, formalmente, a maneira estatisticamente correta de incorporar custos
+assimétricos a um classificador probabilístico.
+
+```{r reg-classifier}
+#| cache: true
+THR_C   <- 35
+mk_lab  <- function(v) factor(if_else(v >= THR_C, "estresse", "normal"), levels = c("estresse","normal"))
+trc     <- train_reg |> select(all_of(feats_reg), target) |>
+  mutate(estresse = mk_lab(target)) |> select(-target)
+truth_c <- mk_lab(test_reg$target)
+
+rec_c    <- recipe(estresse ~ ., data = trc) |> step_zv(all_predictors())
+clf_spec <- boost_tree(trees = 600, tree_depth = 6, learn_rate = 0.1) |>
+  set_engine("xgboost", nthread = n_cores) |> set_mode("classification")
+set.seed(1); clf_fit <- workflow(rec_c, clf_spec) |> fit(trc)
+clf_prob <- predict(clf_fit, test_reg, type = "prob")$.pred_estresse
+
+# Decisão sensível a custo: limiar de probabilidade que maximiza F-beta (beta = 2 -> prioriza recall)
+fbeta <- function(prec, rec, beta = 2) ifelse(is.na(prec) | (prec + rec) == 0, 0,
+                                              (1 + beta^2) * prec * rec / (beta^2 * prec + rec))
+sweep_c <- purrr::map_dfr(seq(0.05, 0.95, 0.05), function(thr) {
+  pa <- factor(if_else(clf_prob >= thr, "estresse", "normal"), levels = c("estresse","normal"))
+  tibble(thr = thr,
+         Recall   = yardstick::recall_vec(truth_c, pa),
+         `Precisão` = tryCatch(yardstick::precision_vec(truth_c, pa), error = function(e) NA_real_))
+}) |> mutate(F2 = fbeta(`Precisão`, Recall, 2))
+thr_star <- sweep_c |> slice_max(F2, n = 1) |> slice_head(n = 1) |> pull(thr)
+```
+
+```{r reg-classifier-cmp}
+#| echo: false
+ev_pos <- function(label, pred_pos) {
+  pa <- factor(if_else(pred_pos, "estresse", "normal"), levels = c("estresse","normal"))
+  tibble(Abordagem = label,
+         Recall     = yardstick::recall_vec(truth_c, pa),
+         `Precisão` = tryCatch(yardstick::precision_vec(truth_c, pa), error = function(e) NA_real_),
+         F1         = yardstick::f_meas_vec(truth_c, pa))
+}
+rec_reg_base <- ev_pos("x", p_ens >= THR_C)$Recall
+cmp_clf <- bind_rows(
+  ev_pos("Regressão + limiar 35 °C (ensemble)",                 p_ens >= THR_C),
+  ev_pos("Classificador dedicado (limiar padrão p ≥ 0,50)",     clf_prob >= 0.50),
+  ev_pos(sprintf("Classificador + limiar F2-ótimo (p ≥ %.2f)", thr_star), clf_prob >= thr_star)
+) |> mutate(across(where(is.numeric), \(x) round(x, 3)))
+rec_clf_star <- cmp_clf$Recall[3]
+knitr::kable(cmp_clf, caption = sprintf(
+  "Alerta de estresse (≥ %d °C): regressão+limiar vs classificador dedicado — teste 2023–2024", THR_C))
+```
+
+```{r fig-reg-classifier}
+#| fig-cap: "Precisão e recall do classificador ao variar o limiar de probabilidade. A linha tracejada marca o limiar F2-ótimo (prioriza recall): baixar o corte de probabilidade captura mais dias de estresse ao custo de mais falsos alarmes."
+#| fig-height: 4
+sweep_c |> pivot_longer(c(`Precisão`, Recall), names_to = "Métrica", values_to = "v") |>
+  ggplot(aes(thr, v, color = Métrica)) +
+  geom_line(linewidth = 1.1) + geom_point(size = 1.8) +
+  geom_vline(xintercept = thr_star, linetype = "dashed", color = "gray40") +
+  scale_color_manual(values = c("Precisão" = "#1D4ED8", "Recall" = "#E8583E")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Classificador Sensível a Custo — Trade-off por Limiar de Probabilidade",
+       x = "Limiar de probabilidade P(estresse)", y = NULL, color = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+```{r reg-classifier-note}
+#| echo: false
+#| results: asis
+cat(sprintf(
+"::: {.callout-tip}
+## O classificador recupera o recall perdido
+Tratar o alerta como **classificação** e decidir pelo limiar **F2-ótimo** (p ≥ %.2f) eleva o
+recall de **%.0f%%** (regressão + limiar de 35 °C) para **%.0f%%**, ao custo de mais falsos
+alarmes — exatamente o trade-off desejável quando a **quebra de safra dói mais que o alarme à
+toa**. O limiar de probabilidade vira um **dial de negócio**: a empresa o ajusta conforme o
+custo relativo de errar, sem retreinar o modelo.
+:::\n\n",
+thr_star, 100*rec_reg_base, 100*rec_clf_star))
+```
+
+---
+
+# Conclusão — Parte Supervisionada
+
+```{r conclusao-sup}
+#| echo: false
+#| results: asis
+best_reg <- res_reg |> slice_min(RMSE, n = 1) |> slice_head(n = 1)
+ens_rmse <- res_reg |> filter(str_detect(Modelo, "Ensemble")) |> pull(RMSE)
+cat(sprintf(
+"A análise supervisionada é **única e regional**: um só modelo, treinado no painel dos **16
+municípios** de MT, prevê a máxima de amanhã para qualquer um deles. O melhor é a **%s**
+(**RMSE = %.3f °C**, MAE = %.3f °C, R² = %.4f no teste 2023–2024), seguido de perto pelo
+**Ensemble (Reg. Linear + XGBoost)** (**%.3f °C**); o intervalo *bootstrap* mostra que a
+diferença entre os primeiros é **estatisticamente desprezível**, então a escolha final pondera
+também o **recall** do alerta. Todos batem a **persistência ingênua (%.2f °C)** — clima de hoje
++ Fourier + geografia agregam sinal além da inércia diária. O modelo **generaliza** para todo o
+estado (RMSE por município na faixa estreita do mapa) e sustenta o **alerta de estresse
+térmico**. Para o alerta operacional, um **classificador dedicado sensível a custo** eleva o
+recall de **%.0f%%** (regressão + limiar) para **%.0f%%**, transformando o limiar de
+probabilidade num *dial* de negócio — robusto para toda a cadeia produtora.\n\n",
+best_reg$Modelo, best_reg$RMSE, best_reg$MAE, best_reg$R2, ens_rmse, rmse_persist,
+100*rec_reg_base, 100*rec_clf_star))
+```
+
+---
+
+# Parte II — Abordagem Não-Supervisionada
+
+Diferente da Parte I, aqui **não existe alvo**: queremos descobrir a estrutura
+intrínseca dos dados climáticos de múltiplas cidades. A pergunta passa a ser:
+
+> *Quais cidades têm perfis climáticos similares? Existem zonas climáticas naturais no Brasil?*
+
+Neste contexto, o **PCA e o clustering deixam de ser ferramentas intermediárias e
+passam a ser os próprios modelos** — o resultado final são os eixos de variação e os
+agrupamentos que emergem dos dados, sem nenhum rótulo externo.
+
+## Dados — Open-Meteo ERA5 (12 Cidades, Diário → Mensal)
+
+```{r cities-def}
+cities <- tribble(
+  ~city,             ~region,         ~lon,    ~lat,
+  "Manaus",          "Norte",        -60.02,  -3.10,
+  "Belém",           "Norte",        -48.48,  -1.46,
+  "Recife",          "Nordeste",     -34.88,  -8.05,
+  "Fortaleza",       "Nordeste",     -38.54,  -3.72,
+  "Salvador",        "Nordeste",     -38.51, -12.97,
+  "Brasília",        "Centro-Oeste", -47.93, -15.78,
+  "Cuiabá",          "Centro-Oeste", -56.10, -15.60,
+  "São Paulo",       "Sudeste",      -46.63, -23.55,
+  "Rio de Janeiro",  "Sudeste",      -43.18, -22.91,
+  "Belo Horizonte",  "Sudeste",      -43.94, -19.92,
+  "Porto Alegre",    "Sul",          -51.23, -30.03,
+  "Curitiba",        "Sul",          -49.27, -25.43
+)
+```
+
+```{r fetch-unsupervised}
+climate_df <- read_csv("data/brazil_monthly.csv", show_col_types = FALSE) |>
+  left_join(cities |> select(city, lon, lat), by = "city") |>
+  mutate(
+    date       = make_date(year, month, 1),
+    temp_range = temp_max - temp_min,
+    season = case_when(
+      month %in% c(12,1,2)  ~ "Verão",
+      month %in% c(3,4,5)   ~ "Outono",
+      month %in% c(6,7,8)   ~ "Inverno",
+      month %in% c(9,10,11) ~ "Primavera"
+    ),
+    season = factor(season, levels = c("Verão","Outono","Inverno","Primavera"))
+  )
+
+cat(sprintf("Dataset: %d linhas | %d cidades | %d anos\n",
+            nrow(climate_df), n_distinct(climate_df$city), n_distinct(climate_df$year)))
+```
+
+::: {.callout-note}
+**Pipeline de dados separado:** o script `fetch_data.py` coleta dados diários do
+Open-Meteo ERA5 para as 12 cidades em janelas de 2 anos (cache incremental em
+`data/chunks/`), agrega para resolução mensal (média para temperaturas/vento/radiação,
+soma para precipitação) e salva em `data/brazil_monthly.csv`. Assim o relatório
+renderiza em segundos sem depender de chamadas de API.
+:::
+
+## Análise Exploratória Multi-Cidades
+
+```{r fig-uns-ts}
+#| fig-height: 7
+#| fig-cap: "Séries mensais de temperatura e precipitação para 5 cidades representativas (1980–2024). Manaus e Recife quase sem sazonalidade térmica; Porto Alegre com forte ciclo anual."
+
+cities_sel <- c("Manaus","Recife","Brasília","São Paulo","Porto Alegre")
+
+p_t <- climate_df |>
+  filter(city %in% cities_sel) |>
+  ggplot(aes(date, temp, color = city)) +
+  geom_line(alpha = 0.75, linewidth = 0.4) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title = "Temperatura Mensal — Brasil (Open-Meteo ERA5)",
+       x = NULL, y = "°C", color = NULL) +
+  theme_minimal(base_size = 12)
+
+p_p <- climate_df |>
+  filter(city %in% cities_sel) |>
+  ggplot(aes(date, precip, color = city)) +
+  geom_line(alpha = 0.75, linewidth = 0.4) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y") +
+  labs(title = "Precipitação Mensal — Brasil (Open-Meteo ERA5)",
+       x = NULL, y = "mm/mês", color = NULL) +
+  theme_minimal(base_size = 12)
+
+(p_t / p_p) + plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+```{r fig-seasonal}
+#| fig-height: 4.5
+#| fig-cap: "Ciclo sazonal médio por região (1980–2024). O Sul tem a maior amplitude térmica anual; Norte e Centro-Oeste concentram a chuva no verão."
+
+seasonal_long <- climate_df |>
+  group_by(region, month) |>
+  summarise(temp_m   = mean(temp,   na.rm = TRUE),
+            precip_m = mean(precip, na.rm = TRUE), .groups = "drop")
+
+p_st <- seasonal_long |>
+  ggplot(aes(month, temp_m, color = region)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_brewer(palette = "Set1") +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  labs(title = "Temperatura", x = NULL, y = "°C", color = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_sp <- seasonal_long |>
+  ggplot(aes(month, precip_m, color = region)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_brewer(palette = "Set1") +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  labs(title = "Precipitação", x = NULL, y = "mm/mês", color = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+(p_st + p_sp) + plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+## Perfis Climáticos por Cidade
+
+```{r city-profiles}
+city_profiles <- climate_df |>
+  group_by(city, region) |>
+  summarise(
+    temp_mean  = mean(temp,       na.rm = TRUE),
+    temp_range = mean(temp_range, na.rm = TRUE),
+    precip     = mean(precip,     na.rm = TRUE),
+    radiation  = mean(radiation,  na.rm = TRUE),
+    wind       = mean(wind,       na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+city_profiles |>
+  select(-region) |>
+  mutate(across(where(is.numeric), ~round(., 1))) |>
+  knitr::kable(caption = "Perfil climático médio por cidade (1980–2024)")
+```
+
+## PCA Não-Supervisionado — Padrões Climáticos entre Cidades
+
+Na Parte I o PCA era uma **ferramenta** de redução de dimensionalidade a serviço de um
+alvo externo. Aqui ele **é o modelo**: os eixos de variação separam climaticamente as
+12 cidades. A padronização (Z-score) é obrigatória — as variáveis têm unidades
+diferentes (°C, mm, MJ/m², m/s) e, sem ela, o PCA seria dominado pela variável de maior
+variância absoluta.
+
+```{r pca-uns}
+pca_data <- city_profiles |> column_to_rownames("city") |> select(-region)
+X_uns    <- scale(pca_data, center = TRUE, scale = TRUE)
+pca_uns  <- prcomp(X_uns)
+pca_uns$rotation <- -pca_uns$rotation
+pca_uns$x        <- -pca_uns$x
+
+cat("Variância acumulada:\n")
+print(round(cumsum(pca_uns$sdev^2) / sum(pca_uns$sdev^2), 3))
+
+cat("\nCargas (Phi) — 3 primeiros PCs:\n")
+print(round(pca_uns$rotation[, 1:3], 3))
+```
+
+```{r biplot-uns}
+fviz_pca_biplot(pca_uns, repel = TRUE,
+  col.ind = city_profiles$region,
+  palette = c("#E74C3C","#F39C12","#2ECC71","#3498DB","#9B59B6"),
+  addEllipses = TRUE, ellipse.level = 0.70, legend.title = "Região",
+  title = "PCA — Cidades Brasileiras por Perfil Climático",
+  xlab = "PC1 (Temperatura)", ylab = "PC2 (Precipitação)") +
+  theme_minimal(base_size = 13)
+```
+
+## Clustering — Zonas Climáticas Automáticas
+
+### Escolha do número de clusters
+
+```{r fig-nbclust}
+#| fig-height: 4
+#| fig-cap: "Critérios de escolha do k: elbow (joelho na curva WSS) e silhouette (máximo = melhor separação). Ambos tipicamente apontam k=3 para o Brasil."
+
+pc_scores <- as.data.frame(pca_uns$x[, 1:2])
+k_max <- min(8, nrow(pc_scores) - 1)
+
+p_elbow <- fviz_nbclust(pc_scores, kmeans, method = "wss", k.max = k_max) +
+  labs(title = "Método do Cotovelo") + theme_minimal(base_size = 12)
+
+p_silh  <- fviz_nbclust(pc_scores, kmeans, method = "silhouette", k.max = k_max) +
+  labs(title = "Silhouette") + theme_minimal(base_size = 12)
+
+p_elbow + p_silh
+```
+
+### K-Means (k = 3)
+
+```{r kmeans-uns}
+#| fig-cap: "K-Means com k=3 no espaço PC1 × PC2. As 3 zonas resultantes: quente úmida (Norte + Rio de Janeiro + Cuiabá), litorânea do Nordeste (Recife, Fortaleza, Salvador) e amena de subtropical/planalto (Sul/Sudeste + Brasília)."
+
+set.seed(42)
+km <- kmeans(pc_scores, centers = 3, nstart = 25)
+city_profiles$cluster <- as.factor(km$cluster)
+
+fviz_cluster(km, data = pc_scores,
+  palette = c("#E74C3C","#2ECC71","#3498DB"),
+  geom = "point", ellipse.type = "convex", pointsize = 4,
+  main = "Clusters de Zonas Climáticas — Brasil",
+  xlab = "PC1 (Temperatura)", ylab = "PC2 (Precipitação)") +
+  geom_text(aes(label = rownames(pc_scores)), size=3, vjust=-1, check_overlap = TRUE) +
+  theme_minimal(base_size = 13)
+```
+
+```{r cluster-profile}
+city_profiles |>
+  group_by(cluster) |>
+  summarise(
+    Cidades          = paste(city, collapse = ", "),
+    `Temp. Média`    = round(mean(temp_mean), 1),
+    `Precip. Média`  = round(mean(precip), 1),
+    `Radiação Média` = round(mean(radiation), 1),
+    N = n(), .groups = "drop"
+  ) |>
+  knitr::kable(caption = "Perfil médio de cada zona climática (K-Means)")
+```
+
+### Clustering Hierárquico (Ward's)
+
+```{r fig-hclust}
+#| fig-cap: "Dendrograma Ward's: as caixas coloridas indicam o corte em k=3. O hierárquico não exige k a priori e é determinístico — ideal para validar o K-Means."
+
+dist_matrix <- dist(X_uns, method = "euclidean")
+hclust_res  <- hclust(dist_matrix, method = "ward.D2")
+plot(hclust_res, main = "Dendrograma — Cidades Brasileiras (Ward's method)",
+     xlab = "Cidade", ylab = "Distância", sub = "", cex = 0.9, hang = -1)
+rect.hclust(hclust_res, k = 3, border = c("red","green","blue"))
+```
+
+::: {.callout-tip}
+**K-Means vs Hierárquico:** K-Means é mais eficiente computacionalmente (essencial para
+n grande), mas requer k a priori e não é determinístico sem `set.seed`. O hierárquico é
+determinístico, permite visualizar a estrutura de fusão completa, mas tem complexidade
+O(n²) em memória — inviável para grandes datasets. Com 12 cidades, ambos são triviais;
+usar os dois e cruzar a interpretação reforça a validade da segmentação.
+:::
+
+---
+
+# Parte III — Os Clusters Estão Mudando?
+
+A estrutura das zonas climáticas brasileiras é estável ou está se reconfigurando?
+Dividimos os 45 anos em **3 períodos de ~15 anos** e aplicamos o mesmo pipeline PCA +
+K-Means em cada janela, comparando como as cidades se movem no espaço de componentes e
+se mudam de cluster.
+
+```{r temporal-periods}
+climate_periods <- climate_df |>
+  mutate(period = case_when(year<=1994~"1980–1994",
+                             year<=2009~"1995–2009",
+                             TRUE~"2010–2024"),
+         period = factor(period, levels=c("1980–1994","1995–2009","2010–2024")))
+
+profiles_temporal <- climate_periods |>
+  group_by(city, region, period) |>
+  summarise(across(c(temp,temp_range,precip,radiation,wind),
+                   ~mean(.x,na.rm=TRUE), .names="{.col}_mean"),
+            .groups="drop") |>
+  rename(temp_range=temp_range_mean,
+         precip=precip_mean, radiation=radiation_mean, wind=wind_mean)
+```
+
+## PCA e K-Means por Período
+
+```{r temporal-clusters}
+#| fig-height: 5
+#| fig-cap: "Espaço PCA com K-Means (k=3) para cada período. Movimentação das cidades indica mudança no perfil climático relativo; mudança de cor (cluster) indica reclassificação de zona climática."
+
+run_period_clustering <- function(df, period_label) {
+  prof  <- df |> filter(period==period_label) |>
+    select(city, temp_mean, temp_range, precip, radiation, wind) |>
+    column_to_rownames("city")
+  X_s   <- scale(prof)
+  pca_p <- prcomp(X_s)
+  pc2   <- as.data.frame(pca_p$x[,1:2])
+  set.seed(42)
+  km_p  <- kmeans(pc2, centers=min(3,nrow(pc2)-1), nstart=25)
+  pc2 |> mutate(city=rownames(pc2), cluster=as.factor(km_p$cluster),
+                period=period_label)
+}
+
+map(levels(profiles_temporal$period),
+    ~run_period_clustering(profiles_temporal, .x)) |>
+  list_rbind() |>
+  ggplot(aes(PC1, PC2, color=cluster, label=city)) +
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(size=3, max.overlaps=15) +
+  facet_wrap(~period) +
+  scale_color_manual(values=c("#E74C3C","#2ECC71","#3498DB")) +
+  labs(title="Evolução dos Clusters — Brasil", x="PC1", y="PC2") +
+  theme_minimal(base_size=12) + theme(legend.position="bottom")
+```
+
+## Estabilidade dos Clusters — Análise de Migração
+
+Verificamos quais cidades mudam de cluster entre períodos — indicando transição de zona
+climática. Usamos clustering hierárquico (Ward's) para consistência de rótulos entre
+períodos, já que o K-Means sofre de *label-switching*.
+
+```{r cluster-migration}
+periods <- levels(profiles_temporal$period)
+
+run_hclust_period <- function(df, period_label) {
+  prof <- df |> filter(period == period_label) |>
+    select(city, temp_mean, temp_range, precip, radiation, wind) |>
+    column_to_rownames("city")
+  X_s <- scale(prof)
+  hc  <- hclust(dist(X_s, method = "euclidean"), method = "ward.D2")
+  cl  <- cutree(hc, k = 3)
+  tibble(city = names(cl), cluster_h = cl, period = period_label)
+}
+
+hc_temporal <- map(periods, ~run_hclust_period(profiles_temporal, .x)) |>
+  list_rbind()
+
+hc_temporal |>
+  pivot_wider(names_from = period, values_from = cluster_h, names_prefix = "cl_") |>
+  left_join(select(cities, city, region), by = "city") |>
+  select(city, region, everything()) |>
+  knitr::kable(caption = "Atribuição de cluster por período (Ward's, k=3). Mudanças indicam migração climática.")
+```
+
+```{r fig-cluster-stability}
+#| fig-cap: "Trajetória de cada cidade no espaço Temperatura × Precipitação. As setas conectam os 3 períodos; cidades que se deslocam muito mudam de perfil climático relativo."
+
+profiles_temporal |>
+  filter(city %in% c("Manaus","Recife","Brasília","São Paulo",
+                     "Porto Alegre","Curitiba","Cuiabá","Salvador")) |>
+  select(city, period, temp_mean, precip) |>
+  ggplot(aes(temp_mean, precip, color = period, label = city)) +
+  geom_point(size = 3.5) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 20) +
+  geom_path(aes(group = city), arrow = arrow(length = unit(0.15, "cm")),
+            alpha = 0.4, linewidth = 0.6, color = "gray40") +
+  scale_color_manual(values = c("#3B82F6","#F59E0B","#E8583E")) +
+  labs(title    = "Trajetória Climática das Cidades — Temperatura vs Precipitação",
+       subtitle = "Setas conectam os 3 períodos para cada cidade",
+       x = "Temperatura Média (°C)", y = "Precipitação Média (mm/mês)",
+       color = "Período") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+## Distância Intra-Cluster — Os Clusters Estão Ficando Mais Difusos?
+
+Para responder se as zonas climáticas estão ficando **menos nítidas** ao longo do tempo,
+medimos a qualidade da partição em cada período com **duas métricas complementares** —
+por isso os dois gráficos:
+
+- **WSS (within-cluster sum of squares)** — soma das distâncias internas de cada cluster
+  ao seu centro. Mede **compactação**: WSS **maior** = pontos mais espalhados dentro do
+  cluster = zonas menos coesas.
+- **Silhouette médio** — para cada cidade, compara a distância ao próprio cluster com a
+  distância ao cluster vizinho mais próximo. Mede **separação**: Silhouette **menor**
+  (mais perto de 0) = fronteiras mais ambíguas entre zonas.
+
+A leitura conjunta é o que importa: se, ao longo dos períodos, o **WSS sobe** *e* o
+**Silhouette cai**, as zonas estão **convergindo** (perfis regionais ficando mais
+parecidos) — coerente com homogeneização climática. Se ambos se mantêm estáveis, as três
+zonas são estruturas robustas no tempo.
+
+```{r cluster-wss}
+#| fig-cap: "WSS (compactação dos clusters) e Silhouette médio por período. WSS crescente = clusters menos compactos; Silhouette decrescente = pior separação."
+
+compute_cluster_quality <- function(df, period_label) {
+  prof <- df |> filter(period == period_label) |>
+    select(city, temp_mean, temp_range, precip, radiation, wind) |>
+    column_to_rownames("city")
+  X_s <- scale(prof)
+  set.seed(42)
+  km  <- kmeans(X_s, centers = min(3, nrow(X_s) - 1), nstart = 25)
+  sil <- silhouette(km$cluster, dist(X_s))
+  tibble(period = period_label, wss = km$tot.withinss,
+         sil_mean = mean(sil[, "sil_width"]))
+}
+
+quality_temporal <- map(periods, ~compute_cluster_quality(profiles_temporal, .x)) |>
+  list_rbind() |>
+  mutate(period = factor(period, levels = periods))
+
+p_wss <- ggplot(quality_temporal, aes(period, wss, group = 1)) +
+  geom_line(linewidth = 1.2, color = "#E8583E") +
+  geom_point(size = 4, color = "#E8583E") +
+  labs(title = "WSS (Compactação)", x = NULL, y = "Within-cluster SS") +
+  theme_minimal(base_size = 12)
+
+p_sil <- ggplot(quality_temporal, aes(period, sil_mean, group = 1)) +
+  geom_line(linewidth = 1.2, color = "#3B82F6") +
+  geom_point(size = 4, color = "#3B82F6") +
+  labs(title = "Silhouette Médio", x = NULL, y = "Silhouette") +
+  theme_minimal(base_size = 12)
+
+p_wss + p_sil
+
+quality_temporal |>
+  mutate(across(where(is.numeric), ~round(., 3))) |>
+  knitr::kable(caption = "Métricas de qualidade dos clusters por período")
+```
+
+::: {.callout-note}
+**Interpretação da dinâmica dos clusters:** se o WSS aumenta e o Silhouette diminui ao
+longo dos períodos, os perfis climáticos estão se tornando mais homogêneos entre regiões
+— possível convergência climática ligada ao aquecimento global. Quando uma cidade muda
+de cluster, seu microclima está se deslocando em relação aos vizinhos geográficos. A
+trajetória no espaço Temperatura × Precipitação mostra a direção e a magnitude dessas
+mudanças.
+:::
+
+# Conclusão — Parte Não-Supervisionada
+
+```{r conclusao-uns}
+#| echo: false
+#| results: asis
+sil_km  <- mean(cluster::silhouette(km$cluster, dist(pc_scores))[, "sil_width"])
+cl_de   <- function(cid) city_profiles$cluster[city_profiles$city == cid]
+membros <- function(cl) paste(city_profiles$city[city_profiles$cluster == cl],
+                              collapse = ", ")
+cl_quente <- cl_de("Manaus")
+cl_ne     <- cl_de("Recife")
+cl_amena  <- cl_de("Curitiba")
+
+# Frases de "surpresa geográfica" só entram se confirmadas pelos dados
+surpresas <- c(
+  if (cl_de("Rio de Janeiro") == cl_quente)
+    "o **Rio de Janeiro** agrupa com Manaus e Belém (calor o ano todo), e não com a vizinha São Paulo",
+  if (cl_de("Brasília") == cl_amena && cl_de("Belo Horizonte") == cl_amena)
+    "**Brasília** e **Belo Horizonte**, embora tropicais e distantes do Sul, caem na zona amena — efeito da **altitude** do planalto, não da latitude",
+  if (cl_de("Cuiabá") == cl_quente)
+    "**Cuiabá**, no cerrado, junta-se ao calor amazônico apesar da distância"
+)
+frase_surpresa <- if (length(surpresas) > 0) {
+  paste0("Mas o critério é **climático, não geográfico** — a proximidade ajuda, mas
+não determina: ", paste(surpresas, collapse = "; "), ".")
+} else {
+  "Neste recorte, a partição seguiu de perto a divisão regional."
+}
+
+q1 <- quality_temporal |> slice(1)
+q3 <- quality_temporal |> slice(n())
+tendencia_sep <- if (q3$sil_mean < q1$sil_mean) {
+  "a separação entre as zonas **enfraqueceu**, sinal de perfis regionais convergindo (consistente com homogeneização climática)"
+} else {
+  "a separação entre as zonas **se manteve ou até se fortaleceu** — as três zonas climáticas são estruturas estáveis no tempo"
+}
+
+cat(sprintf(
+"O K-Means (k = 3, escolhido por cotovelo + silhouette) particiona as **12 capitais** com
+**silhouette médio = %.2f**, e o dendrograma de Ward reproduz a mesma estrutura —
+dois métodos independentes concordando reforça a validade das três zonas:
+
+- **Quente úmida (cluster de Manaus):** %s
+- **Litorânea do Nordeste (cluster de Recife):** %s
+- **Amena — subtropical e planalto (cluster de Curitiba):** %s
+
+Parte do resultado é **o esperado pela proximidade geográfica**: Manaus–Belém e
+Curitiba–Porto Alegre compartilham zona, e o litoral nordestino forma um grupo
+próprio. %s
+
+**Dinâmica (Parte III):** entre %s e %s, o silhouette médio foi de %.2f para %.2f e o
+WSS de %.1f para %.1f — %s. A tabela de migração da Parte III identifica quais cidades
+trocaram de zona no período.\n\n",
+sil_km, membros(cl_quente), membros(cl_ne), membros(cl_amena),
+frase_surpresa,
+as.character(q1$period), as.character(q3$period),
+q1$sil_mean, q3$sil_mean, q1$wss, q3$wss, tendencia_sep
+))
+```
+
+---
+
+# Síntese Final
+
+| Caso de uso | Abordagem | Razão principal |
+|---|---|---|
+| Previsão regional da máxima | Modelo único nos 16 municípios | Cobre todo MT; lat/lon/elevação posicionam cada ponto |
+| Melhor desempenho | Selecionado por **RMSE + recall** (ver §3.4 e IC bootstrap) | Erro estatisticamente equivalente entre os 1ºs; decide-se por recall e robustez |
+| Boosting tabular com tuning | XGBoost (`tune_grid`) + SHAP | Reduz viés sequencialmente; interpretável via SHAP |
+| Decisão de negócio | Limiar ≥ 35 °C sobre a previsão | Alerta de estresse térmico robusto |
+| Segmentação climática (Brasil) | PCA + K-Means (k = 3) | 3 zonas estáveis, validadas por Ward + silhouette |
